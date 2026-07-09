@@ -678,7 +678,21 @@
     }
 
     let tick = 0;
-    let firstReadTick = null; // 第一筆成功讀值的 tick（初始鎖定暖機期用）
+    let firstReadTick = null;  // 第一筆成功讀值的 tick（初始鎖定暖機期用）
+    let lastAcceptTick = null; // 上次採用讀值的 tick（變化率限制用）
+
+    // 物理連續性：溫度變化從小位數開始反應，高位數不會瞬間跳動。
+    // 允許變化幅度 = 基礎 2°C + 1.5°C/秒 × 距上次採用的時間（tick=100ms）
+    function allowedDelta() {
+        const dt = lastAcceptTick === null ? 0 : tick - lastAcceptTick;
+        return 2 + 0.15 * dt;
+    }
+    function acceptTemp(v) {
+        currentTemp = v;
+        mismatchStreak = 0;
+        lastAcceptTick = tick;
+        displayTemp.innerText = currentTemp.toFixed(1) + ' °C';
+    }
     const WARMUP_TICKS = 30;  // 暖機 3 秒（100ms/tick）：只適用於 3 位數的曖昧讀值；
                               // 4 位數完整讀值（153.8）不可能是缺百位殘缺品，可立即鎖定
     setInterval(() => {
@@ -704,12 +718,11 @@
                 ? `單幀辨識：${result.raw} → 修復為 ${repaired.toFixed(1)}`
                 : `單幀辨識：${result.raw}`;
 
-            // 快速通道：完整讀值且與鎖定值相差 ≤6°C（正常升溫幅度）時，
-            // 跳過投票立即更新——小幅變動低風險，投票只留給大跳變把關
-            if (hasDp && currentTemp !== null && Math.abs(repaired - currentTemp) <= 6) {
-                currentTemp = repaired;
-                mismatchStreak = 0;
-                displayTemp.innerText = currentTemp.toFixed(1) + ' °C';
+            // 快速通道：完整讀值且變化幅度符合物理連續性時，跳過投票立即更新——
+            // 小幅變動低風險，投票只留給大跳變把關（單筆讀值上限 ±10）
+            if (hasDp && currentTemp !== null
+                && Math.abs(repaired - currentTemp) <= Math.min(allowedDelta(), 10)) {
+                acceptTemp(repaired);
             }
         } else {
             ocrRaw.innerText = '單幀辨識：（無法辨識）';
@@ -726,25 +739,22 @@
                         || (voted.numDigits >= 3 && voted.n >= 3
                             && firstReadTick !== null
                             && tick - firstReadTick >= WARMUP_TICKS))) {
-                    currentTemp = voted.value;
-                    mismatchStreak = 0;
+                    acceptTemp(voted.value);
                 }
-            } else if (Math.abs(voted.value - currentTemp) <= (voted.hasDp ? 20 : 6)) {
-                // 追蹤更新：帶小數點的完整讀值容許 ±20；
-                // 殘缺讀值只容許 ±6（烘豆溫度每秒最多變化約 0.5°C）
-                currentTemp = voted.value;
-                mismatchStreak = 0;
+            } else if (Math.abs(voted.value - currentTemp)
+                       <= Math.min(allowedDelta(), voted.hasDp ? 20 : 6)) {
+                // 追蹤更新：變化幅度須符合物理連續性（高位數不會瞬間跳動）；
+                // 完整讀值上限 ±20、殘缺讀值上限 ±6
+                acceptTemp(voted.value);
             } else if (voted.hasDp
                        && (Math.abs(voted.value - (currentTemp + 100)) <= 20
                            || Math.abs(voted.value - (currentTemp + 200)) <= 20)) {
                 // 向上 +100/+200 立即修正：若目前鎖在漏掉百位的低值（53.8），
                 // 出現完整讀值（153.8）時馬上跳上去——憑空多出一位數幾乎不可能
-                currentTemp = voted.value;
-                mismatchStreak = 0;
+                acceptTemp(voted.value);
             } else if (voted.hasDp && ++mismatchStreak >= 10) {
                 // 只有帶小數點的完整讀值能改變鎖定；殘缺讀值再多次也不行
-                currentTemp = voted.value; // 持續約 1 秒的遠離完整讀值 → 重新鎖定
-                mismatchStreak = 0;
+                acceptTemp(voted.value); // 持續約 1 秒的遠離完整讀值 → 重新鎖定
             }
             if (currentTemp !== null) displayTemp.innerText = currentTemp.toFixed(1) + ' °C';
         }
