@@ -119,6 +119,22 @@
         .data-block h3 { margin: 0 0 5px 0; font-size: 14px; color: #86868b; }
         .data-val { font-size: 32px; font-weight: bold; color: #ff453a; font-family: monospace; }
         
+        /* 取樣間隔滑桿 */
+        .sample-rate {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background: white;
+            padding: 10px 15px;
+            border-radius: 12px;
+            margin-bottom: 15px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            font-size: 14px;
+        }
+        .sample-rate label { color: #86868b; white-space: nowrap; }
+        .sample-rate input[type="range"] { flex: 1; accent-color: #ff9500; }
+        #sample-interval-val { font-family: monospace; font-weight: bold; min-width: 42px; text-align: right; }
+
         /* 控制按鈕 */
         .btn-group { display: flex; gap: 10px; margin-bottom: 15px; }
         button {
@@ -178,8 +194,14 @@
         </div>
     </div>
 
+    <div class="sample-rate">
+        <label for="sample-interval">取樣間隔</label>
+        <input type="range" id="sample-interval" min="1" max="10" step="1" value="1">
+        <span id="sample-interval-val">1 秒</span>
+    </div>
+
     <div class="btn-group">
-        <button id="start-btn">開始烘豆（5s取樣）</button>
+        <button id="start-btn">開始烘豆（1s取樣）</button>
         <button id="stop-btn" disabled>停止並匯出</button>
     </div>
 
@@ -639,7 +661,7 @@
                 best = b;
             }
         }
-        return best ? { value: best.latest, numDigits: best.digits, hasDp: best.hasDp } : null;
+        return best ? { value: best.latest, numDigits: best.digits, hasDp: best.hasDp, n: best.n } : null;
     }
 
     // 缺漏百位修復：LED 左半變暗常吃掉開頭的 1/2（153.7 → 53.7），
@@ -657,15 +679,15 @@
 
     let tick = 0;
     let firstReadTick = null; // 第一筆成功讀值的 tick（初始鎖定暖機期用）
-    const WARMUP_TICKS = 25;  // 暖機 5 秒：收集夠多讀值再做初始鎖定，
-                              // 避免搶先鎖到變暗期的殘缺讀值（153.8 讀成 53.8）
+    const WARMUP_TICKS = 30;  // 暖機 3 秒（100ms/tick）：只適用於 3 位數的曖昧讀值；
+                              // 4 位數完整讀值（153.8）不可能是缺百位殘缺品，可立即鎖定
     setInterval(() => {
         if (video.readyState !== video.HAVE_ENOUGH_DATA || !video.videoWidth) return;
         procCanvas.width = video.videoWidth;
         procCanvas.height = video.videoHeight;
         procCtx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
 
-        // 每 3 tick（0.6 秒）重新定位一次數字區域，追蹤畫面晃動
+        // 每 3 tick（0.3 秒）重新定位一次數字區域，追蹤畫面晃動
         refinedAge++;
         if (tick++ % 3 === 0) refineTempRoi();
         updateAutoRoiBox();
@@ -674,12 +696,21 @@
         if (result) {
             if (firstReadTick === null) firstReadTick = tick;
             const repaired = repairReading(result.value, result.raw);
+            const hasDp = result.raw.includes('.');
             // hasDp：顯示器永遠帶一位小數，讀到小數點代表字形完整、品質高
-            readings.push({ value: repaired, hasDp: result.raw.includes('.') });
+            readings.push({ value: repaired, hasDp });
             if (readings.length > VOTE_WINDOW) readings.shift();
             ocrRaw.innerText = repaired !== result.value
                 ? `單幀辨識：${result.raw} → 修復為 ${repaired.toFixed(1)}`
                 : `單幀辨識：${result.raw}`;
+
+            // 快速通道：完整讀值且與鎖定值相差 ≤6°C（正常升溫幅度）時，
+            // 跳過投票立即更新——小幅變動低風險，投票只留給大跳變把關
+            if (hasDp && currentTemp !== null && Math.abs(repaired - currentTemp) <= 6) {
+                currentTemp = repaired;
+                mismatchStreak = 0;
+                displayTemp.innerText = currentTemp.toFixed(1) + ' °C';
+            }
         } else {
             ocrRaw.innerText = '單幀辨識：（無法辨識）';
         }
@@ -688,10 +719,13 @@
         const voted = voteReadings();
         if (voted !== null) {
             if (currentTemp === null) {
-                // 初始鎖定：至少 3 位數字、帶小數點，且暖機期已過——
-                // 暖機期間投票機制會自然讓位數多的桶（153.8）壓過殘缺桶（53.8）
-                if (voted.numDigits >= 3 && voted.hasDp
-                    && firstReadTick !== null && tick - firstReadTick >= WARMUP_TICKS) {
+                // 初始鎖定：4 位數完整讀值（153.8）立即鎖定——不可能是缺百位殘缺品；
+                // 3 位數讀值（53.8 有歧義）須等暖機期過且湊滿 3 票，防止偶發垃圾搶鎖
+                if (voted.hasDp
+                    && (voted.numDigits >= 4
+                        || (voted.numDigits >= 3 && voted.n >= 3
+                            && firstReadTick !== null
+                            && tick - firstReadTick >= WARMUP_TICKS))) {
                     currentTemp = voted.value;
                     mismatchStreak = 0;
                 }
@@ -707,16 +741,16 @@
                 // 出現完整讀值（153.8）時馬上跳上去——憑空多出一位數幾乎不可能
                 currentTemp = voted.value;
                 mismatchStreak = 0;
-            } else if (voted.hasDp && ++mismatchStreak >= 8) {
+            } else if (voted.hasDp && ++mismatchStreak >= 10) {
                 // 只有帶小數點的完整讀值能改變鎖定；殘缺讀值再多次也不行
-                currentTemp = voted.value; // 持續約 1.6 秒的遠離完整讀值 → 重新鎖定
+                currentTemp = voted.value; // 持續約 1 秒的遠離完整讀值 → 重新鎖定
                 mismatchStreak = 0;
             }
             if (currentTemp !== null) displayTemp.innerText = currentTemp.toFixed(1) + ' °C';
         }
-    }, 200);
+    }, 100); // 100ms/tick：投票窗 1 秒，反應延遲約 0.3~1 秒
 
-    // 4. 計時器與 5 秒取樣控制
+    // 4. 計時器與 1 秒取樣控制
     startBtn.addEventListener('click', () => {
         startTime = Date.now();
         timeLabels.length = 0;
@@ -726,22 +760,48 @@
         startBtn.disabled = true;
         stopBtn.disabled = false;
 
-        roastTimer = setInterval(() => {
-            const totalSeconds = Math.round((Date.now() - startTime) / 1000);
-            
-            // 格式化時間軸標籤為 分:秒
-            const mins = Math.floor(totalSeconds / 60);
-            const secs = totalSeconds % 60;
-            const timeStr = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-            
-            displayTime.innerText = timeStr;
+        roastTimer = setInterval(sampleTick, sampleSec * 1000);
+    });
 
-            // 將當前辨識到的溫度塞入圖表（辨識不到時留空，圖表顯示斷點）
-            timeLabels.push(timeStr);
-            tempData.push(currentTemp === null ? null : parseFloat(currentTemp.toFixed(1)));
-            roastChart.update();
+    // 每次取樣：記錄經過時間與當前辨識溫度
+    function sampleTick() {
+        const totalSeconds = Math.round((Date.now() - startTime) / 1000);
 
-        }, 5000); // 嚴格每 5 秒取樣一次
+        // 格式化時間軸標籤為 分:秒
+        const mins = Math.floor(totalSeconds / 60);
+        const secs = totalSeconds % 60;
+        const timeStr = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+
+        displayTime.innerText = timeStr;
+
+        // 將當前辨識到的溫度塞入圖表（辨識不到時留空，圖表顯示斷點）
+        timeLabels.push(timeStr);
+        tempData.push(currentTemp === null ? null : parseFloat(currentTemp.toFixed(1)));
+        roastChart.update();
+    }
+
+    // 取樣間隔設定（1～10 秒，記憶於 localStorage；烘豆中調整立即生效）
+    const sampleSlider = document.getElementById('sample-interval');
+    const sampleValEl = document.getElementById('sample-interval-val');
+    const SAMPLE_KEY = 'probat-sample-interval';
+    let sampleSec = parseInt(localStorage.getItem(SAMPLE_KEY), 10);
+    if (!(sampleSec >= 1 && sampleSec <= 10)) sampleSec = 1;
+
+    function applySampleUi() {
+        sampleValEl.innerText = `${sampleSec} 秒`;
+        startBtn.innerText = `開始烘豆（${sampleSec}s取樣）`;
+        sampleSlider.value = sampleSec;
+    }
+    applySampleUi();
+
+    sampleSlider.addEventListener('input', () => {
+        sampleSec = parseInt(sampleSlider.value, 10);
+        localStorage.setItem(SAMPLE_KEY, String(sampleSec));
+        applySampleUi();
+        if (roastTimer) { // 烘豆進行中：以新間隔重啟計時器（時間軸以絕對經過時間計算，不受影響）
+            clearInterval(roastTimer);
+            roastTimer = setInterval(sampleTick, sampleSec * 1000);
+        }
     });
 
     stopBtn.addEventListener('click', () => {
