@@ -586,9 +586,11 @@
         roiAutoEl.style.height = (refinedRoi.height / video.videoHeight * 100) + '%';
     }
 
-    // 單幀辨識：成功回傳 { value, raw }，失敗（閃爍缺字等）回傳 null
-    function recognizeTemp() {
-        // 優先使用自動鎖定的區域；鎖定過舊（>3 秒）退回使用者紅框
+    // 單幀掃描：回傳此幀「讀得到的位數」清單（可以只有部分位數）與小數點位置。
+    // 不再要求整幀完整——整數位穩定期長，逐位數累積投票遠比單幀全對可靠。
+    let avgDigitW = null; // 一般數字的相對寬度（供窄字元「1」推算槽位中心）
+    function scanFrame() {
+        // 優先使用自動鎖定的區域；鎖定過舊（>1.5 秒）退回使用者紅框
         const roi = (refinedRoi && refinedAge < 15) ? refinedRoi : getRoiPixelRect('roi-temp');
         if (roi.width < 16 || roi.height < 10) return null;
         const imgData = procCtx.getImageData(roi.x, roi.y, roi.width, roi.height);
@@ -602,38 +604,109 @@
         const maxH = Math.max(...clusters.map(c => c.ch));
         // 填滿率過濾：疊在同一直欄的指示燈圓點會形成高瘦但稀疏的群，
         // 真正的數字（含「1」）在邊界框內填滿率遠高於 0.3
-        const digits = clusters
+        const digitClusters = clusters
             .filter(c => c.ch > maxH * 0.6 && c.count / (c.cw * c.ch) >= 0.3)
             .sort((a, b) => a.x0 - b.x0);
-        if (digits.length < 2 || digits.length > 4) return null;
-        const topLine = Math.min(...digits.map(c => c.top));
+        if (!digitClusters.length || digitClusters.length > 4) return null;
+        const topLine = Math.min(...digitClusters.map(c => c.top));
         // 小數點：矮小且位於數字下緣的群
-        const dots = clusters.filter(c =>
-            c.ch <= maxH * 0.35 && (c.top + c.bot) / 2 > topLine + maxH * 0.65);
+        const dotXs = clusters
+            .filter(c => c.ch <= maxH * 0.35 && (c.top + c.bot) / 2 > topLine + maxH * 0.65)
+            .map(c => ((c.x0 + c.x1) / 2) / roi.width);
 
-        const chars = [];
-        for (const d of digits) {
-            const val = decodeDigit(mask, roi.width, d);
-            if (val === null) return null; // 字形不完整，丟棄交給多數決
-            chars.push(String(val));
+        const digits = [];
+        for (const c of digitClusters) {
+            const val = decodeDigit(mask, roi.width, c);
+            if (val === null) continue; // 這位讀不到就跳過，其他位照收
+            const wRel = c.cw / roi.width;
+            let xc = ((c.x0 + c.x1) / 2) / roi.width;
+            if (c.cw >= c.ch * 0.35) {
+                // 一般寬度數字：更新平均寬度
+                avgDigitW = avgDigitW === null ? wRel : avgDigitW * 0.9 + wRel * 0.1;
+            } else if (avgDigitW !== null) {
+                // 窄字元「1」靠槽位右側，以右緣回推槽位中心
+                xc = (c.x1 / roi.width) - avgDigitW / 2;
+            }
+            digits.push({ xc, value: val });
         }
-        for (const p of dots) {
-            const cx = (p.x0 + p.x1) / 2;
-            let idx = -1;
-            digits.forEach((d, i) => { if (d.x1 < cx) idx = i; });
-            if (idx >= 0 && idx < chars.length - 1) chars[idx] += '.';
+        if (!digits.length) return null;
+        return { digits, dotXs, roi };
+    }
+
+    // 位數槽位模型：溫度變化從小位數開始反應，高位數穩定很久——
+    // 每個位數槽獨立投票，用足各自穩定期內的所有幀
+    const slots = [];      // { xc, votes: [{v, tick}], roleInt, roleTenth }
+    let slotBoxKey = null;
+
+    function resetSlotsIfBoxJumped(roi) {
+        if (slotBoxKey) {
+            const dx = Math.abs(roi.x - slotBoxKey.x);
+            const dw = Math.abs(roi.width - slotBoxKey.width);
+            if (dx > roi.width * 0.1 || dw > roi.width * 0.15) slots.length = 0;
         }
-        let str = chars.join('');
-        if ((str.match(/\./g) || []).length > 1) return null;
-        let value = parseFloat(str);
-        // PROBAT 顯示固定一位小數，但小數點 LED 較暗常漏抓：
-        // 無小數點且數值超過合理範圍時，把最後一位視為小數位（如 1538 → 153.8）
-        if (!str.includes('.') && value > 400 && str.length >= 2) {
-            str = str.slice(0, -1) + '.' + str.slice(-1);
-            value = parseFloat(str);
+        slotBoxKey = { x: roi.x, width: roi.width };
+    }
+
+    function feedSlots(scan) {
+        for (const d of scan.digits) {
+            let s = null, best = 0.06; // 槽位配對容差：ROI 寬度的 6%
+            for (const cand of slots) {
+                const dist = Math.abs(cand.xc - d.xc);
+                if (dist < best) { best = dist; s = cand; }
+            }
+            if (!s) { s = { xc: d.xc, votes: [] }; slots.push(s); }
+            s.xc = s.xc * 0.8 + d.xc * 0.2;
+            s.votes.push({ v: d.value, tick });
+            if (s.votes.length > 20) s.votes.shift();
+        }
+        // 清除 3 秒沒觀測到的槽位
+        for (let i = slots.length - 1; i >= 0; i--)
+            if (!slots[i].votes.some(v => tick - v.tick <= 30)) slots.splice(i, 1);
+    }
+
+    function slotMode(s, windowTicks, minVotes) {
+        const freq = {};
+        let bestV = null, bestN = 0;
+        for (const e of s.votes) {
+            if (tick - e.tick > windowTicks) continue;
+            freq[e.v] = (freq[e.v] || 0) + 1;
+            if (freq[e.v] > bestN) { bestN = freq[e.v]; bestV = e.v; }
+        }
+        return bestN >= minVotes ? bestV : null;
+    }
+
+    // 結構先驗：PROBAT 顯示器固定一位小數 → 最右槽位＝小數位，其餘＝整數位。
+    // 不依賴小數點偵測（點太小太暗，經常整段影片抓不到）。
+    function assembleReading() {
+        const ordered = slots.slice().sort((a, b) => a.xc - b.xc);
+        if (ordered.length < 3 || ordered.length > 5) return null;
+
+        // 槽距檢查：位數等距排列，出現 1.6 倍以上的間距代表中間有位數缺席
+        //（例如個位槽過期後 155.9 會被誤組成 15.9）
+        const gaps = [];
+        for (let i = 1; i < ordered.length; i++) gaps.push(ordered[i].xc - ordered[i - 1].xc);
+        if (Math.max(...gaps) > Math.min(...gaps) * 1.6) return null;
+
+        const intSlots = ordered.slice(0, -1);
+        const tenthSlot = ordered[ordered.length - 1];
+
+        let intStr = '';
+        for (const s of intSlots) {
+            const v = slotMode(s, 20, 2); // 整數位很穩：2 秒窗、至少 2 票
+            if (v === null) return null;
+            intStr += v;
+        }
+        // 小數位變化快：取 0.8 秒內最新讀值；讀不到就只回整數（品質降級）
+        const tv = slotMode(tenthSlot, 8, 1);
+        let raw = tv !== null ? `${intStr}.${tv}` : intStr;
+        let value = parseFloat(raw);
+        // 安全網：無小數點且超出合理範圍 → 末位視為小數位（如 1538 → 153.8）
+        if (tv === null && value > 400 && raw.length >= 2) {
+            raw = raw.slice(0, -1) + '.' + raw.slice(-1);
+            value = parseFloat(raw);
         }
         if (!isFinite(value) || value < 0 || value > 400) return null;
-        return { value, raw: str };
+        return { value, raw };
     }
 
     // 多數決：取樣窗內出現至少 3 次的讀值中，優先採信位數最多者。
@@ -706,7 +779,14 @@
         if (tick++ % 3 === 0) refineTempRoi();
         updateAutoRoiBox();
 
-        const result = recognizeTemp();
+        // 逐位數掃描 → 餵入槽位投票 → 組合讀值
+        const scan = scanFrame();
+        let result = null;
+        if (scan) {
+            resetSlotsIfBoxJumped(scan.roi);
+            feedSlots(scan);
+            result = assembleReading();
+        }
         if (result) {
             if (firstReadTick === null) firstReadTick = tick;
             const repaired = repairReading(result.value, result.raw);
@@ -714,9 +794,10 @@
             // hasDp：顯示器永遠帶一位小數，讀到小數點代表字形完整、品質高
             readings.push({ value: repaired, hasDp });
             if (readings.length > VOTE_WINDOW) readings.shift();
+            const frameInfo = scan ? `（本幀 ${scan.digits.length} 位）` : '';
             ocrRaw.innerText = repaired !== result.value
-                ? `單幀辨識：${result.raw} → 修復為 ${repaired.toFixed(1)}`
-                : `單幀辨識：${result.raw}`;
+                ? `位數組合：${result.raw} → 修復為 ${repaired.toFixed(1)}${frameInfo}`
+                : `位數組合：${result.raw}${frameInfo}`;
 
             // 快速通道：完整讀值且變化幅度符合物理連續性時，跳過投票立即更新——
             // 小幅變動低風險，投票只留給大跳變把關（單筆讀值上限 ±10）
@@ -725,7 +806,9 @@
                 acceptTemp(repaired);
             }
         } else {
-            ocrRaw.innerText = '單幀辨識：（無法辨識）';
+            ocrRaw.innerText = scan
+                ? `位數組合：（累積中，本幀 ${scan.digits.length} 位）`
+                : '位數組合：（無法辨識）';
         }
         // 連續性鎖定：烘豆溫度變化緩慢，突然偏離超過 20°C 的讀值
         // 多半是缺字誤判，須連續出現才重新鎖定
@@ -752,6 +835,9 @@
                 // 向上 +100/+200 立即修正：若目前鎖在漏掉百位的低值（53.8），
                 // 出現完整讀值（153.8）時馬上跳上去——憑空多出一位數幾乎不可能
                 acceptTemp(voted.value);
+            } else if (voted.hasDp && Math.abs(voted.value * 10 - currentTemp) <= 20) {
+                // 十倍位移防護：讀值×10 ≈ 鎖定值（155.X 掉個位變 15.5）
+                // 是典型的掉位誤組——不採信、也不累積重鎖
             } else if (voted.hasDp && ++mismatchStreak >= 10) {
                 // 只有帶小數點的完整讀值能改變鎖定；殘缺讀值再多次也不行
                 acceptTemp(voted.value); // 持續約 1 秒的遠離完整讀值 → 重新鎖定
