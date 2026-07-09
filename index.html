@@ -133,6 +133,17 @@
             cursor: pointer;
         }
         .src-btn.active { background: #1d1d1f; color: white; border-color: #1d1d1f; }
+        #src-msg {
+            background: #fff3cd;
+            border: 1px solid #ffe69c;
+            color: #664d03;
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 13px;
+            line-height: 1.6;
+            margin-bottom: 10px;
+            white-space: pre-line;
+        }
 
         /* 取樣間隔滑桿 */
         .sample-rate {
@@ -189,6 +200,7 @@
         <button id="src-file" class="src-btn">🎬 讀取影片檔</button>
         <input type="file" id="video-file-input" accept="video/*" style="display:none">
     </div>
+    <div id="src-msg" style="display:none"></div>
 
     <div class="camera-wrapper">
         <video id="video" autoplay playsinline></video>
@@ -402,11 +414,41 @@
         displayTemp.innerText = '--.- °C';
     }
 
+    const srcMsg = document.getElementById('src-msg');
+    function showSrcMsg(text) {
+        srcMsg.innerText = text;
+        srcMsg.style.display = text ? 'block' : 'none';
+    }
+
+    // 依錯誤類型給出可操作的修復指引
+    function cameraErrorHelp(err) {
+        const ua = navigator.userAgent;
+        if (/Line\/|FBAN|FBAV|Instagram/i.test(ua)) {
+            return '⚠️ 你正在 LINE／FB 等 App 的內建瀏覽器中，通常不支援相機。\n' +
+                   '請點右上角選單，選「用 Safari／Chrome 開啟」後再試。';
+        }
+        if (err.name === 'NotAllowedError') {
+            const isIOS = /iPhone|iPad/i.test(ua);
+            return '⚠️ 相機權限被拒絕。開啟權限後重新整理頁面，再點「📷 相機」：\n' +
+                   (isIOS
+                     ? '① 網址列左側「AA」→ 網站設定 → 相機 → 允許\n② 或手機「設定」→ Safari → 相機 → 允許'
+                     : '① 網址列的 🔒 鎖頭圖示 → 權限 → 相機 → 允許\n② 或手機「設定」→ 應用程式 → 瀏覽器 → 權限 → 相機');
+        }
+        if (err.name === 'NotFoundError' || err.name === 'NotSupportedError') {
+            return '⚠️ 找不到可用的相機裝置，請改用「🎬 讀取影片檔」。';
+        }
+        if (err.name === 'NotReadableError') {
+            return '⚠️ 相機正被其他 App 佔用，關閉其他使用相機的 App 後再點「📷 相機」。';
+        }
+        return `⚠️ 無法開啟相機（${err.name}），請改用「🎬 讀取影片檔」。`;
+    }
+
     function useCamera() {
         stopCurrentSource();
         setActiveSource(srcCameraBtn);
+        showSrcMsg('');
         if (!navigator.mediaDevices) {
-            ocrRaw.innerText = '此環境無相機可用，請改用「讀取影片檔」';
+            showSrcMsg('⚠️ 此環境無相機可用（需 HTTPS 網址），請改用「🎬 讀取影片檔」。');
             return;
         }
         navigator.mediaDevices.getUserMedia({
@@ -421,7 +463,7 @@
                 .then(s => { cameraStream = s; video.srcObject = s; })
                 .catch(err => {
                     console.error('無法開啟相機:', err);
-                    ocrRaw.innerText = '無法開啟相機（' + err.name + '），請改用「讀取影片檔」';
+                    showSrcMsg(cameraErrorHelp(err));
                 });
         });
     }
@@ -436,6 +478,7 @@
     function useVideoFile(file) {
         stopCurrentSource();
         setActiveSource(srcFileBtn);
+        showSrcMsg('');
         fileObjectUrl = URL.createObjectURL(file);
         playVideoSrc(fileObjectUrl);
     }
@@ -443,6 +486,7 @@
     function useDemoVideo() {
         stopCurrentSource();
         setActiveSource(srcFileBtn);
+        showSrcMsg('');
         playVideoSrc('video.mp4');
     }
 
