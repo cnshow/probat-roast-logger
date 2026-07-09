@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PROBAT 烘豆溫度曲線觀測器</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            margin: 0;
+            padding: 15px;
+            background-color: #f5f5f7;
+            color: #333;
+        }
+        h2 { text-align: center; margin-bottom: 10px; color: #1d1d1f; }
+        .container { max-width: 600px; margin: 0 auto; }
+        
+        /* 相機與對準框設計 */
+        .camera-wrapper {
+            position: relative;
+            width: 100%;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        #video { width: 100%; display: block; }
+        
+        /* 雙紅框定位（可手動拖曳調整，位置記憶於 localStorage） */
+        .roi-container {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+        }
+        .roi-box {
+            position: absolute;
+            border: 3px solid #ff3b30;
+            box-sizing: border-box;
+            pointer-events: auto;  /* 讓紅框可接收拖曳操作 */
+            touch-action: none;    /* 拖曳時不觸發頁面捲動 */
+            cursor: move;
+        }
+        /* 自動鎖定的實際數字區域（程式在紅框內自行偵測） */
+        #roi-auto {
+            position: absolute;
+            border: 2px dashed #34c759;
+            box-sizing: border-box;
+            pointer-events: none;
+            display: none;
+        }
+        #roi-auto::after {
+            content: '自動鎖定';
+            position: absolute;
+            bottom: -20px;
+            left: 0;
+            background: #34c759;
+            color: white;
+            font-size: 11px;
+            padding: 1px 5px;
+            border-radius: 0 0 4px 4px;
+        }
+        .roi-handle {
+            position: absolute;
+            right: -2px;
+            bottom: -2px;
+            width: 24px;
+            height: 24px;
+            background: rgba(255, 59, 48, 0.85);
+            border-radius: 6px 0 0 0;
+            cursor: nwse-resize;
+            touch-action: none;
+        }
+        .roi-hint {
+            text-align: center;
+            font-size: 13px;
+            color: #86868b;
+            margin: 8px 0 0 0;
+        }
+
+        /* 辨識除錯列：顯示二值化後的溫度框影像與單幀辨識結果 */
+        .ocr-debug-bar {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 6px;
+        }
+        #debug-canvas {
+            height: 36px;
+            background: #000;
+            border-radius: 4px;
+            image-rendering: pixelated;
+        }
+        #ocr-raw { font-family: monospace; font-size: 13px; color: #86868b; }
+        .roi-box::after {
+            content: attr(data-label);
+            position: absolute;
+            top: -22px;
+            left: 0;
+            background: #ff3b30;
+            color: white;
+            font-size: 12px;
+            padding: 2px 6px;
+            border-radius: 4px 4px 0 0;
+        }
+
+        /* 數據顯示面板 */
+        .dashboard {
+            display: flex;
+            justify-content: space-between;
+            margin: 15px 0;
+            background: white;
+            padding: 15px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        .data-block { text-align: center; width: 48%; }
+        .data-block h3 { margin: 0 0 5px 0; font-size: 14px; color: #86868b; }
+        .data-val { font-size: 32px; font-weight: bold; color: #ff453a; font-family: monospace; }
+        
+        /* 控制按鈕 */
+        .btn-group { display: flex; gap: 10px; margin-bottom: 15px; }
+        button {
+            flex: 1;
+            padding: 12px;
+            font-size: 16px;
+            font-weight: bold;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        #start-btn { background-color: #34c759; color: white; }
+        #start-btn:disabled { background-color: #aeaeb2; }
+        #stop-btn { background-color: #ff3b30; color: white; }
+        #stop-btn:disabled { background-color: #aeaeb2; }
+        
+        /* 圖表區域 */
+        .chart-wrapper {
+            background: white;
+            padding: 15px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        
+        /* 隱藏用於處理影像的 Canvas */
+        #processing-canvas { display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>🔥 PROBAT 烘豆曲線觀測</h2>
+    
+    <div class="camera-wrapper">
+        <video id="video" autoplay playsinline></video>
+        <div class="roi-container">
+            <div class="roi-box" id="roi-time" data-label="對準左邊時間"><div class="roi-handle"></div></div>
+            <div class="roi-box" id="roi-temp" data-label="對準右邊溫度"><div class="roi-handle"></div></div>
+            <div id="roi-auto"></div>
+        </div>
+    </div>
+    <p class="roi-hint">💡 紅框大致框住溫度顯示器即可（可拖曳／右下角縮放／雙擊重設），綠色虛線會自動鎖定數字區域</p>
+    <div class="ocr-debug-bar">
+        <canvas id="debug-canvas" width="10" height="10"></canvas>
+        <span id="ocr-raw">單幀辨識：等待影像…</span>
+    </div>
+
+    <div class="dashboard">
+        <div class="data-block">
+            <h3>目前時間</h3>
+            <div id="display-time" class="data-val">--:--</div>
+        </div>
+        <div class="data-block">
+            <h3>即時溫度</h3>
+            <div id="display-temp" class="data-val">--.- °C</div>
+        </div>
+    </div>
+
+    <div class="btn-group">
+        <button id="start-btn">開始烘豆（5s取樣）</button>
+        <button id="stop-btn" disabled>停止並匯出</button>
+    </div>
+
+    <div class="chart-wrapper">
+        <canvas id="roastChart"></canvas>
+    </div>
+</div>
+
+<canvas id="processing-canvas"></canvas>
+
+<script>
+    const video = document.getElementById('video');
+    const startBtn = document.getElementById('start-btn');
+    const stopBtn = document.getElementById('stop-btn');
+    const displayTime = document.getElementById('display-time');
+    const displayTemp = document.getElementById('display-temp');
+    const procCanvas = document.getElementById('processing-canvas');
+    const procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
+
+    let roastTimer = null;
+    let startTime = 0;
+    let currentTemp = null; // 多數決濾波後的辨識溫度（尚未辨識到時為 null）
+    
+    // 圖表數據陣列
+    const timeLabels = [];
+    const tempData = [];
+
+    // 1. 初始化 Chart.js
+    const ctx = document.getElementById('roastChart').getContext('2d');
+    const roastChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: timeLabels,
+            datasets: [{
+                label: '豆溫曲線 (°C)',
+                data: tempData,
+                borderColor: '#ff9500',
+                backgroundColor: 'rgba(255, 149, 0, 0.1)',
+                borderWidth: 3,
+                tension: 0.2,
+                fill: true
+            }]
+        },
+        options: {
+            responsive: true,
+            scales: {
+                x: { title: { display: true, text: '時間 (分:秒)' } },
+                y: { min: 20, max: 250, title: { display: true, text: '溫度 (°C)' } }
+            }
+        }
+    });
+
+    // 1.5 可手動調整的 ROI 紅框：拖曳移動、右下角把手縮放、雙擊重設
+    //     位置以百分比記錄（相對於影像區域），並存入 localStorage 供下次使用
+    const cameraWrapper = document.querySelector('.camera-wrapper');
+    const ROI_STORAGE_KEY = 'probat-roi-config';
+    const ROI_DEFAULTS = {
+        'roi-time': { left: 10, top: 60, width: 34, height: 10 },
+        'roi-temp': { left: 54, top: 60, width: 34, height: 10 }
+    };
+
+    function loadRoiConfig() {
+        try {
+            return JSON.parse(localStorage.getItem(ROI_STORAGE_KEY)) || {};
+        } catch (e) {
+            return {};
+        }
+    }
+    const roiConfig = Object.assign({}, ROI_DEFAULTS, loadRoiConfig());
+
+    function saveRoiConfig() {
+        localStorage.setItem(ROI_STORAGE_KEY, JSON.stringify(roiConfig));
+    }
+
+    function applyRoi(box) {
+        const c = roiConfig[box.id];
+        box.style.left = c.left + '%';
+        box.style.top = c.top + '%';
+        box.style.width = c.width + '%';
+        box.style.height = c.height + '%';
+    }
+
+    // 將 ROI 百分比換算為 video 原始像素座標（供後續影像辨識擷取用）
+    function getRoiPixelRect(id) {
+        const c = roiConfig[id];
+        return {
+            x: Math.round(video.videoWidth * c.left / 100),
+            y: Math.round(video.videoHeight * c.top / 100),
+            width: Math.round(video.videoWidth * c.width / 100),
+            height: Math.round(video.videoHeight * c.height / 100)
+        };
+    }
+
+    function makeAdjustable(box) {
+        applyRoi(box);
+        const handle = box.querySelector('.roi-handle');
+        let mode = null;
+        let startX = 0, startY = 0, startRect = null;
+
+        box.addEventListener('pointerdown', e => {
+            mode = (e.target === handle) ? 'resize' : 'move';
+            startX = e.clientX;
+            startY = e.clientY;
+            startRect = Object.assign({}, roiConfig[box.id]);
+            try { box.setPointerCapture(e.pointerId); } catch (err) { /* 部分環境不支援 pointer capture */ }
+            e.preventDefault();
+        });
+
+        box.addEventListener('pointermove', e => {
+            if (!mode) return;
+            const dx = (e.clientX - startX) / cameraWrapper.clientWidth * 100;
+            const dy = (e.clientY - startY) / cameraWrapper.clientHeight * 100;
+            const c = roiConfig[box.id];
+            if (mode === 'move') {
+                c.left = Math.min(Math.max(startRect.left + dx, 0), 100 - c.width);
+                c.top = Math.min(Math.max(startRect.top + dy, 0), 100 - c.height);
+            } else {
+                c.width = Math.min(Math.max(startRect.width + dx, 8), 100 - c.left);
+                c.height = Math.min(Math.max(startRect.height + dy, 4), 100 - c.top);
+            }
+            applyRoi(box);
+        });
+
+        function endDrag() {
+            if (!mode) return;
+            mode = null;
+            saveRoiConfig();
+        }
+        box.addEventListener('pointerup', endDrag);
+        box.addEventListener('pointercancel', endDrag);
+
+        // 雙擊重設回預設位置
+        box.addEventListener('dblclick', () => {
+            roiConfig[box.id] = Object.assign({}, ROI_DEFAULTS[box.id]);
+            applyRoi(box);
+            saveRoiConfig();
+        });
+    }
+    document.querySelectorAll('.roi-box').forEach(makeAdjustable);
+
+    // 2. 影像來源：預設啟動手機後置鏡頭；
+    //    加上 ?source=mp4 參數（或相機不可用時）改讀取本地 video.mp4 進行驗證
+    function useTestVideo() {
+        video.srcObject = null;
+        video.src = 'video.mp4';
+        video.muted = true;   // 靜音才允許自動播放
+        video.loop = true;
+        video.play().catch(err => console.error('video.mp4 播放失敗:', err));
+    }
+
+    const useMp4 = new URLSearchParams(location.search).get('source') === 'mp4';
+    if (useMp4 || !navigator.mediaDevices) {
+        useTestVideo();
+    } else {
+        navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { exact: "environment" } },
+            audio: false
+        }).then(stream => {
+            video.srcObject = stream;
+        }).catch(err => {
+            // 若環境不支援強行指定後鏡頭（如電腦測試），則彈性獲取
+            navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+                     .then(s => video.srcObject = s)
+                     .catch(useTestVideo); // 完全無相機時退回 video.mp4
+        });
+    }
+
+    // 3. 影像處理與七段 LED 數字辨識
+    //    流程：擷取溫度紅框 → 過濾紅色像素 → 直欄投影切出字元 →
+    //          七段區域取樣解碼 → 多數決濾波（解決掃描線閃爍缺字問題）
+    const debugCanvas = document.getElementById('debug-canvas');
+    const debugCtx = debugCanvas.getContext('2d');
+    const ocrRaw = document.getElementById('ocr-raw');
+
+    // 七段顯示器樣式對照表（segment 順序：A上 B右上 C右下 D下 E左下 F左上 G中）
+    const SEG_PATTERNS = {
+        '1111110': 0, '0110000': 1, '1101101': 2, '1111001': 3, '0110011': 4,
+        '1011011': 5, '1011111': 6, '1110000': 7, '1111111': 8, '1111011': 9
+    };
+    // 各 segment 在字元邊界框內的取樣區域 [x0%, x1%, y0%, y1%]
+    const SEG_ZONES = [
+        [0.15, 0.85, 0.00, 0.18], // A 上橫
+        [0.60, 1.00, 0.10, 0.45], // B 右上豎
+        [0.60, 1.00, 0.55, 0.90], // C 右下豎
+        [0.15, 0.85, 0.82, 1.00], // D 下橫
+        [0.00, 0.40, 0.55, 0.90], // E 左下豎
+        [0.00, 0.40, 0.10, 0.45], // F 左上豎
+        [0.15, 0.85, 0.40, 0.60]  // G 中橫
+    ];
+    const VOTE_WINDOW = 10; // 多數決取樣窗：10 筆 × 200ms = 2 秒
+    const readings = [];
+    let mismatchStreak = 0; // 連續偏離讀值計數（連續性鎖定用）
+
+    // 註：LED 掃描閃爍造成的不完整幀直接丟棄（decodeDigit 回傳 null），
+    //     由多數決濾波在時間軸上重建正確讀值；多幀疊加會因手持晃動糊化，不採用。
+
+    function buildRedMask(imgData) {
+        const { data, width: w, height: h } = imgData;
+        const n = w * h;
+        // 紅色分數 = 紅通道超出綠/藍的量；先做直方圖找出此幀的亮度水準
+        const score = new Int16Array(n);
+        const hist = new Int32Array(256);
+        for (let i = 0; i < n; i++) {
+            const s = data[i * 4] - Math.max(data[i * 4 + 1], data[i * 4 + 2]);
+            score[i] = s;
+            hist[Math.max(0, Math.min(255, s))]++;
+        }
+        // 取 99.5 百分位當「此幀最亮紅色」，避免單一雜訊像素干擾
+        let acc = 0, p995 = 0;
+        const target = n * 0.005;
+        for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc >= target) { p995 = v; break; } }
+        // 自適應閾值：跟著此幀亮度走（LED 掃描變暗時整體變暗，相對亮度仍在），
+        // 但設下限避免全暗幀把雜訊放大成訊號
+        const th = Math.max(28, p995 * 0.35);
+        const mask = new Uint8Array(n);
+        let lit = 0;
+        for (let i = 0; i < n; i++) {
+            if (score[i] > th && data[i * 4] > 85) { mask[i] = 1; lit++; }
+        }
+        return { mask, lit };
+    }
+
+    function findClusters(mask, w, h) {
+        // 直欄投影：有紅色像素的連續欄位視為同一字元，欄位間空隙即字元間隔
+        const colCount = new Uint16Array(w);
+        for (let x = 0; x < w; x++) {
+            let c = 0;
+            for (let y = 0; y < h; y++) if (mask[y * w + x]) c++;
+            colCount[x] = c;
+        }
+        const maxGap = Math.max(2, Math.round(w * 0.02));
+        const spans = [];
+        let start = -1, gap = 0;
+        for (let x = 0; x < w; x++) {
+            if (colCount[x] > 0) { if (start < 0) start = x; gap = 0; }
+            else if (start >= 0 && ++gap > maxGap) { spans.push([start, x - gap]); start = -1; }
+        }
+        if (start >= 0) spans.push([start, w - 1]);
+
+        return spans.map(([x0, x1]) => {
+            let top = h, bot = 0, count = 0;
+            for (let y = 0; y < h; y++)
+                for (let x = x0; x <= x1; x++)
+                    if (mask[y * w + x]) { if (y < top) top = y; if (y > bot) bot = y; count++; }
+            return { x0, x1, top, bot, count, cw: x1 - x0 + 1, ch: bot - top + 1 };
+        }).filter(c => c.count >= 8); // 太小的雜訊群丟棄
+    }
+
+    function decodeDigit(mask, w, c) {
+        if (c.cw < c.ch * 0.35) return 1; // 窄字元（只有右側兩豎段）直接視為 1
+        // 各段位的亮像素比例
+        const fracs = SEG_ZONES.map(([fx0, fx1, fy0, fy1]) => {
+            const x0 = c.x0 + Math.floor(fx0 * c.cw), x1 = c.x0 + Math.ceil(fx1 * c.cw) - 1;
+            const y0 = c.top + Math.floor(fy0 * c.ch), y1 = c.top + Math.ceil(fy1 * c.ch) - 1;
+            let litPx = 0, total = 0;
+            for (let y = y0; y <= y1; y++)
+                for (let x = x0; x <= x1; x++) { total++; if (mask[y * w + x]) litPx++; }
+            return litPx / total;
+        });
+        // 最大似然解碼：對 10 個數字模板計分（亮段位比例高加分、暗段位比例低加分），
+        // 取最高分；與第二名差距不足表示字形曖昧，此幀丟棄交給多數決
+        let best = null, bestScore = -Infinity, second = -Infinity;
+        for (const [bits, digit] of Object.entries(SEG_PATTERNS)) {
+            let s = 0;
+            for (let i = 0; i < 7; i++)
+                s += (bits[i] === '1') ? (fracs[i] - 0.25) : (0.25 - fracs[i]);
+            if (s > bestScore) { second = bestScore; bestScore = s; best = digit; }
+            else if (s > second) second = s;
+        }
+        if (bestScore - second < 0.12) return null; // 信心不足
+        return best;
+    }
+
+    function drawDebugMask(mask, w, h) {
+        debugCanvas.width = w;
+        debugCanvas.height = h;
+        const out = debugCtx.createImageData(w, h);
+        for (let i = 0; i < w * h; i++) {
+            out.data[i * 4] = mask[i] ? 255 : 0;
+            out.data[i * 4 + 3] = 255;
+        }
+        debugCtx.putImageData(out, 0, 0);
+    }
+
+    // 自動 ROI 精煉：使用者只需大致框住顯示器，程式在框內尋找
+    // 「黑色顯示窗＋紅色 LED」的實際數字區域，並隨畫面晃動自動追蹤。
+    // 做法：暗區＋紅區做連通元件分析，取含紅色像素最多的元件（＝顯示窗；
+    // 面板上的指示燈圓點是孤立小元件，自然被排除）。
+    let refinedRoi = null; // 精煉後的 ROI（video 像素座標）
+    let refinedAge = 99;   // 距上次成功精煉的 tick 數，過舊即退回使用者紅框
+
+    function refineTempRoi() {
+        const coarse = getRoiPixelRect('roi-temp');
+        if (coarse.width < 24 || coarse.height < 16) return;
+        const img = procCtx.getImageData(coarse.x, coarse.y, coarse.width, coarse.height);
+        const d = img.data;
+        // 下採樣 2 倍以加速連通元件搜尋
+        const dw = coarse.width >> 1, dh = coarse.height >> 1;
+        const n = dw * dh;
+        const mark = new Uint8Array(n);   // 1 = 暗或紅（顯示窗候選）
+        const isRed = new Uint8Array(n);
+        const luma = new Float32Array(n);
+        let lumaSum = 0;
+        for (let y = 0; y < dh; y++)
+            for (let x = 0; x < dw; x++) {
+                const si = ((y * 2) * coarse.width + x * 2) * 4;
+                const r = d[si], g = d[si + 1], b = d[si + 2];
+                const i = y * dw + x;
+                luma[i] = 0.3 * r + 0.6 * g + 0.1 * b;
+                lumaSum += luma[i];
+                if (r - Math.max(g, b) > 40 && r > 85) { isRed[i] = 1; mark[i] = 1; }
+            }
+        // 暗區閾值隨框內平均亮度調整（顯示窗是黑的、面板是淺灰）
+        const darkTh = Math.min(100, Math.max(50, (lumaSum / n) * 0.55));
+        for (let i = 0; i < n; i++) if (luma[i] < darkTh) mark[i] = 1;
+
+        // BFS 連通元件：在暗區＋紅區中尋找「LED 顯示窗」。
+        // 鑑別條件（排除紅色按鈕等大片紅色物體）：
+        //   1. 暗底比例：顯示窗是黑底紅字，暗像素須多於紅像素；按鈕整片紅、無暗底
+        //   2. 紅色數量：太少代表只是雜訊或指示燈圓點
+        const label = new Int32Array(n);
+        const stack = [];
+        let cur = 0, bestRed = 0, bestBox = null;
+        for (let s = 0; s < n; s++) {
+            if (!mark[s] || label[s]) continue;
+            cur++;
+            let x0 = dw, x1 = 0, y0 = dh, y1 = 0, redN = 0, totalN = 0;
+            stack.length = 0; stack.push(s); label[s] = cur;
+            while (stack.length) {
+                const p = stack.pop();
+                const px = p % dw, py = (p / dw) | 0;
+                if (px < x0) x0 = px; if (px > x1) x1 = px;
+                if (py < y0) y0 = py; if (py > y1) y1 = py;
+                totalN++;
+                if (isRed[p]) redN++;
+                if (px > 0 && mark[p - 1] && !label[p - 1]) { label[p - 1] = cur; stack.push(p - 1); }
+                if (px < dw - 1 && mark[p + 1] && !label[p + 1]) { label[p + 1] = cur; stack.push(p + 1); }
+                if (py > 0 && mark[p - dw] && !label[p - dw]) { label[p - dw] = cur; stack.push(p - dw); }
+                if (py < dh - 1 && mark[p + dw] && !label[p + dw]) { label[p + dw] = cur; stack.push(p + dw); }
+            }
+            const darkN = totalN - redN;
+            if (redN >= 15 && darkN > redN && redN > bestRed) {
+                bestRed = redN;
+                bestBox = { x0, x1, y0, y1, id: cur };
+            }
+        }
+        if (!bestBox) return; // 找不到合格的顯示窗（LED 全暗幀等），保留上次結果
+
+        // 垂直方向裁到紅色數字所在列帶＋餘裕
+        //（避免顯示窗與機身暗部相連時，框到整片機身）
+        let ry0 = dh, ry1 = 0;
+        for (let y = bestBox.y0; y <= bestBox.y1; y++)
+            for (let x = bestBox.x0; x <= bestBox.x1; x++) {
+                const i = y * dw + x;
+                if (isRed[i] && label[i] === bestBox.id) { if (y < ry0) ry0 = y; if (y > ry1) ry1 = y; }
+            }
+        const padY = Math.max(2, Math.round((ry1 - ry0) * 0.3));
+        const fy0 = Math.max(bestBox.y0, ry0 - padY);
+        const fy1 = Math.min(bestBox.y1, ry1 + padY);
+
+        const rx = coarse.x + Math.max(0, bestBox.x0 - 1) * 2;
+        const ry = coarse.y + fy0 * 2;
+        const rw = Math.min(coarse.width, (bestBox.x1 - bestBox.x0 + 3) * 2);
+        const rh = Math.min(coarse.height, (fy1 - fy0 + 2) * 2);
+        if (rw < 20 || rh < 10) return;
+        if (rw / rh < 1.5) return; // 顯示窗必然寬扁；接近方形／圓形的是按鈕等誤判
+        refinedRoi = { x: rx, y: ry, width: rw, height: rh };
+        refinedAge = 0;
+    }
+
+    // 綠色虛線框顯示自動鎖定的區域
+    const roiAutoEl = document.getElementById('roi-auto');
+    function updateAutoRoiBox() {
+        if (!refinedRoi || refinedAge >= 15 || !video.videoWidth) {
+            roiAutoEl.style.display = 'none';
+            return;
+        }
+        roiAutoEl.style.display = 'block';
+        roiAutoEl.style.left = (refinedRoi.x / video.videoWidth * 100) + '%';
+        roiAutoEl.style.top = (refinedRoi.y / video.videoHeight * 100) + '%';
+        roiAutoEl.style.width = (refinedRoi.width / video.videoWidth * 100) + '%';
+        roiAutoEl.style.height = (refinedRoi.height / video.videoHeight * 100) + '%';
+    }
+
+    // 單幀辨識：成功回傳 { value, raw }，失敗（閃爍缺字等）回傳 null
+    function recognizeTemp() {
+        // 優先使用自動鎖定的區域；鎖定過舊（>3 秒）退回使用者紅框
+        const roi = (refinedRoi && refinedAge < 15) ? refinedRoi : getRoiPixelRect('roi-temp');
+        if (roi.width < 16 || roi.height < 10) return null;
+        const imgData = procCtx.getImageData(roi.x, roi.y, roi.width, roi.height);
+        const { mask, lit } = buildRedMask(imgData);
+        drawDebugMask(mask, roi.width, roi.height);
+        if (lit < 20) return null;
+
+        const clusters = findClusters(mask, roi.width, roi.height);
+        if (!clusters.length) return null;
+
+        const maxH = Math.max(...clusters.map(c => c.ch));
+        // 填滿率過濾：疊在同一直欄的指示燈圓點會形成高瘦但稀疏的群，
+        // 真正的數字（含「1」）在邊界框內填滿率遠高於 0.3
+        const digits = clusters
+            .filter(c => c.ch > maxH * 0.6 && c.count / (c.cw * c.ch) >= 0.3)
+            .sort((a, b) => a.x0 - b.x0);
+        if (digits.length < 2 || digits.length > 4) return null;
+        const topLine = Math.min(...digits.map(c => c.top));
+        // 小數點：矮小且位於數字下緣的群
+        const dots = clusters.filter(c =>
+            c.ch <= maxH * 0.35 && (c.top + c.bot) / 2 > topLine + maxH * 0.65);
+
+        const chars = [];
+        for (const d of digits) {
+            const val = decodeDigit(mask, roi.width, d);
+            if (val === null) return null; // 字形不完整，丟棄交給多數決
+            chars.push(String(val));
+        }
+        for (const p of dots) {
+            const cx = (p.x0 + p.x1) / 2;
+            let idx = -1;
+            digits.forEach((d, i) => { if (d.x1 < cx) idx = i; });
+            if (idx >= 0 && idx < chars.length - 1) chars[idx] += '.';
+        }
+        let str = chars.join('');
+        if ((str.match(/\./g) || []).length > 1) return null;
+        let value = parseFloat(str);
+        // PROBAT 顯示固定一位小數，但小數點 LED 較暗常漏抓：
+        // 無小數點且數值超過合理範圍時，把最後一位視為小數位（如 1538 → 153.8）
+        if (!str.includes('.') && value > 400 && str.length >= 2) {
+            str = str.slice(0, -1) + '.' + str.slice(-1);
+            value = parseFloat(str);
+        }
+        if (!isFinite(value) || value < 0 || value > 400) return null;
+        return { value, raw: str };
+    }
+
+    // 多數決：取樣窗內出現至少 3 次的讀值中，優先採信位數最多者。
+    // LED 變暗缺字會讓「153.7」讀成「3.7」，反向（多出數字）幾乎不會發生，
+    // 因此位數多的讀值可信度更高。
+    function voteReadings() {
+        if (!readings.length) return null;
+        // 以整數部分分桶：小數位每秒都在變，逐值計票永遠湊不齊票數
+        const buckets = {};
+        for (const r of readings) {
+            const k = Math.floor(r.value);
+            if (!buckets[k]) buckets[k] = { n: 0, hasDp: false, digits: 0, latest: r.value };
+            const b = buckets[k];
+            b.n++;
+            if (r.hasDp) b.hasDp = true;
+            // 品質分數 = 整數位數 + 是否帶小數點（153.3 → 4 分，勝過 150 → 3 分）
+            b.digits = Math.max(b.digits, String(k).length + (r.hasDp ? 1 : 0));
+            b.latest = r.value; // 桶內取最新讀值，保留小數精度
+        }
+        let best = null;
+        for (const b of Object.values(buckets)) {
+            // 帶小數點的高品質桶 2 票即可，殘缺讀值桶要 3 票
+            if (b.n < (b.hasDp ? 2 : 3)) continue;
+            if (!best || b.digits > best.digits || (b.digits === best.digits && b.n > best.n)) {
+                best = b;
+            }
+        }
+        return best ? { value: best.latest, numDigits: best.digits, hasDp: best.hasDp } : null;
+    }
+
+    // 缺漏百位修復：LED 左半變暗常吃掉開頭的 1/2（153.7 → 53.7），
+    // 若讀值加回 100/200 後與目前鎖定值吻合，即視為同一數值救回。
+    // 僅限帶小數點的讀值——有小數點代表尾部完整、缺的是開頭；
+    // 沒有小數點的讀值（如 15）可能是缺尾巴（155 → 15），不能加百位硬修。
+    function repairReading(v, raw) {
+        if (!raw.includes('.')) return v;
+        if (currentTemp === null || Math.abs(v - currentTemp) <= 20) return v;
+        for (const add of [100, 200]) {
+            if (Math.abs(v + add - currentTemp) <= 20) return v + add;
+        }
+        return v;
+    }
+
+    let tick = 0;
+    setInterval(() => {
+        if (video.readyState !== video.HAVE_ENOUGH_DATA || !video.videoWidth) return;
+        procCanvas.width = video.videoWidth;
+        procCanvas.height = video.videoHeight;
+        procCtx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
+
+        // 每 3 tick（0.6 秒）重新定位一次數字區域，追蹤畫面晃動
+        refinedAge++;
+        if (tick++ % 3 === 0) refineTempRoi();
+        updateAutoRoiBox();
+
+        const result = recognizeTemp();
+        if (result) {
+            const repaired = repairReading(result.value, result.raw);
+            // hasDp：顯示器永遠帶一位小數，讀到小數點代表字形完整、品質高
+            readings.push({ value: repaired, hasDp: result.raw.includes('.') });
+            if (readings.length > VOTE_WINDOW) readings.shift();
+            ocrRaw.innerText = repaired !== result.value
+                ? `單幀辨識：${result.raw} → 修復為 ${repaired.toFixed(1)}`
+                : `單幀辨識：${result.raw}`;
+        } else {
+            ocrRaw.innerText = '單幀辨識：（無法辨識）';
+        }
+        // 連續性鎖定：烘豆溫度變化緩慢，突然偏離超過 20°C 的讀值
+        // 多半是缺字誤判，須連續出現才重新鎖定
+        const voted = voteReadings();
+        if (voted !== null) {
+            if (currentTemp === null) {
+                // 初始鎖定門檻：至少 3 位數字且帶小數點，避免鎖到殘缺讀值
+                if (voted.numDigits >= 3 && voted.hasDp) { currentTemp = voted.value; mismatchStreak = 0; }
+            } else if (Math.abs(voted.value - currentTemp) <= 20) {
+                currentTemp = voted.value;
+                mismatchStreak = 0;
+            } else if (voted.hasDp && ++mismatchStreak >= 8) {
+                // 只有帶小數點的完整讀值能改變鎖定；殘缺讀值再多次也不行
+                currentTemp = voted.value; // 持續約 1.6 秒的遠離完整讀值 → 重新鎖定
+                mismatchStreak = 0;
+            }
+            if (currentTemp !== null) displayTemp.innerText = currentTemp.toFixed(1) + ' °C';
+        }
+    }, 200);
+
+    // 4. 計時器與 5 秒取樣控制
+    startBtn.addEventListener('click', () => {
+        startTime = Date.now();
+        timeLabels.length = 0;
+        tempData.length = 0;
+        roastChart.update();
+
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+
+        roastTimer = setInterval(() => {
+            const totalSeconds = Math.round((Date.now() - startTime) / 1000);
+            
+            // 格式化時間軸標籤為 分:秒
+            const mins = Math.floor(totalSeconds / 60);
+            const secs = totalSeconds % 60;
+            const timeStr = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+            
+            displayTime.innerText = timeStr;
+
+            // 將當前辨識到的溫度塞入圖表（辨識不到時留空，圖表顯示斷點）
+            timeLabels.push(timeStr);
+            tempData.push(currentTemp === null ? null : parseFloat(currentTemp.toFixed(1)));
+            roastChart.update();
+
+        }, 5000); // 嚴格每 5 秒取樣一次
+    });
+
+    stopBtn.addEventListener('click', () => {
+        clearInterval(roastTimer);
+        roastTimer = null;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+
+        // 烘豆結束：自動生成 CSV 下載檔案
+        let csvContent = "data:text/csv;charset=utf-8,時間,溫度(°C)\n";
+        timeLabels.forEach((label, index) => {
+            csvContent += `${label},${tempData[index] === null ? '' : tempData[index]}\n`;
+        });
+        
+        const encodedUri = encodeURI(csvContent);
+        const link = document.createElement("a");
+        link.setAttribute("href", encodedUri);
+        link.setAttribute("download", `PROBAT_烘豆紀錄_${new Date().toISOString().slice(0,10)}.csv`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    });
+</script>
+</body>
+</html>
