@@ -145,6 +145,35 @@
             white-space: pre-line;
         }
 
+        /* 相機曝光滑桿（僅支援的裝置顯示） */
+        .exposure-control {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            background: white;
+            padding: 8px 15px;
+            border-radius: 12px;
+            margin-bottom: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            font-size: 14px;
+        }
+        .exposure-control label { color: #86868b; white-space: nowrap; }
+        .exposure-control input[type="range"] { flex: 1; accent-color: #ff9500; }
+        #exposure-val { font-family: monospace; font-size: 13px; min-width: 56px; text-align: right; }
+        #exposure-auto {
+            flex: 0 0 auto;
+            padding: 5px 12px;
+            font-size: 13px;
+            background: #e8e8ed;
+            color: #1d1d1f;
+            border-radius: 6px;
+        }
+        #exposure-note {
+            font-size: 12px;
+            color: #86868b;
+            margin: -4px 0 10px 4px;
+        }
+
         /* 取樣間隔滑桿 */
         .sample-rate {
             display: flex;
@@ -201,6 +230,13 @@
         <input type="file" id="video-file-input" accept="video/*" style="display:none">
     </div>
     <div id="src-msg" style="display:none"></div>
+    <div id="exposure-control" class="exposure-control" style="display:none">
+        <label for="exposure-slider">☀️ 曝光</label>
+        <input type="range" id="exposure-slider">
+        <span id="exposure-val">--</span>
+        <button id="exposure-auto" type="button">自動</button>
+    </div>
+    <div id="exposure-note" style="display:none">☀️ 此瀏覽器不支援網頁曝光控制（iOS Safari 限制）——可改用相機 App 手動曝光錄影後以「讀取影片檔」辨識</div>
 
     <div class="camera-wrapper">
         <video id="video" autoplay playsinline></video>
@@ -399,6 +435,7 @@
         }
         video.srcObject = null;
         video.removeAttribute('src');
+        hideExposureControl();
         resetRecognition();
     }
 
@@ -419,6 +456,87 @@
         srcMsg.innerText = text;
         srcMsg.style.display = text ? 'block' : 'none';
     }
+
+    // 相機曝光控制：透過 applyConstraints 直接調整相機曝光。
+    // Android Chrome 多數支援（exposureCompensation 或 exposureTime）；
+    // iOS Safari 不開放此 API → 顯示提示並隱藏滑桿。
+    const expCtl = document.getElementById('exposure-control');
+    const expSlider = document.getElementById('exposure-slider');
+    const expVal = document.getElementById('exposure-val');
+    const expAutoBtn = document.getElementById('exposure-auto');
+    const expNote = document.getElementById('exposure-note');
+    let expTrack = null, expMode = null;
+
+    function hideExposureControl() {
+        expCtl.style.display = 'none';
+        expNote.style.display = 'none';
+        expTrack = null;
+        expMode = null;
+    }
+
+    function setupExposureControl(stream) {
+        const track = stream.getVideoTracks()[0];
+        if (!track || typeof track.getCapabilities !== 'function') {
+            expNote.style.display = 'block';
+            return;
+        }
+        const caps = track.getCapabilities();
+        const settings = typeof track.getSettings === 'function' ? track.getSettings() : {};
+        expTrack = track;
+        if (caps.exposureCompensation) {
+            // EV 補償：維持自動測光，只偏移明暗（優先，較不易失控）
+            expMode = 'ev';
+            expSlider.min = caps.exposureCompensation.min;
+            expSlider.max = caps.exposureCompensation.max;
+            expSlider.step = caps.exposureCompensation.step || 0.1;
+            expSlider.value = settings.exposureCompensation != null ? settings.exposureCompensation : 0;
+            expVal.innerText = 'EV ' + Number(expSlider.value).toFixed(1);
+            expCtl.style.display = 'flex';
+        } else if (caps.exposureTime) {
+            // 手動快門時間（單位 100µs）：對付 LED 掃描頻閃最直接
+            expMode = 'time';
+            expSlider.min = caps.exposureTime.min;
+            expSlider.max = Math.min(caps.exposureTime.max, 2000); // 上限 0.2 秒避免整片過曝
+            expSlider.step = caps.exposureTime.step || 1;
+            expSlider.value = settings.exposureTime || expSlider.min;
+            expVal.innerText = (expSlider.value / 10).toFixed(1) + 'ms';
+            expCtl.style.display = 'flex';
+        } else {
+            expNote.style.display = 'block';
+        }
+    }
+
+    expSlider.addEventListener('input', () => {
+        if (!expTrack) return;
+        const v = parseFloat(expSlider.value);
+        let constraint;
+        if (expMode === 'ev') {
+            constraint = { exposureCompensation: v };
+            expVal.innerText = 'EV ' + v.toFixed(1);
+        } else {
+            constraint = { exposureMode: 'manual', exposureTime: v };
+            expVal.innerText = (v / 10).toFixed(1) + 'ms';
+        }
+        expTrack.applyConstraints({ advanced: [constraint] }).catch(err => {
+            console.error('曝光設定失敗:', err);
+            expVal.innerText = '不支援';
+        });
+    });
+
+    expAutoBtn.addEventListener('click', () => {
+        if (!expTrack) return;
+        expTrack.applyConstraints({ advanced: [{ exposureMode: 'continuous' }] })
+            .then(() => {
+                if (expMode === 'ev') {
+                    const s = expTrack.getSettings();
+                    expSlider.value = s.exposureCompensation != null ? s.exposureCompensation : 0;
+                    expVal.innerText = 'EV ' + Number(expSlider.value).toFixed(1);
+                } else {
+                    expVal.innerText = '自動';
+                }
+            })
+            .catch(() => {});
+    });
 
     // 依錯誤類型給出可操作的修復指引
     function cameraErrorHelp(err) {
@@ -457,10 +575,15 @@
         }).then(stream => {
             cameraStream = stream;
             video.srcObject = stream;
+            setupExposureControl(stream);
         }).catch(() => {
             // 若環境不支援強行指定後鏡頭（如電腦測試），則彈性獲取
             navigator.mediaDevices.getUserMedia({ video: true })
-                .then(s => { cameraStream = s; video.srcObject = s; })
+                .then(s => {
+                    cameraStream = s;
+                    video.srcObject = s;
+                    setupExposureControl(s);
+                })
                 .catch(err => {
                     console.error('無法開啟相機:', err);
                     showSrcMsg(cameraErrorHelp(err));
