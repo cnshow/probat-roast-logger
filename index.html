@@ -777,6 +777,13 @@
         // 將當前辨識到的溫度塞入圖表（辨識不到時留空，圖表顯示斷點）
         timeLabels.push(timeStr);
         tempData.push(currentTemp === null ? null : parseFloat(currentTemp.toFixed(1)));
+
+        // Y 軸動態範圍：涵蓋 最小值-5 ～ 最大值+5
+        const vals = tempData.filter(v => v !== null);
+        if (vals.length) {
+            roastChart.options.scales.y.min = Math.floor(Math.min(...vals)) - 5;
+            roastChart.options.scales.y.max = Math.ceil(Math.max(...vals)) + 5;
+        }
         roastChart.update();
     }
 
