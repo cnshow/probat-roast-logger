@@ -119,6 +119,21 @@
         .data-block h3 { margin: 0 0 5px 0; font-size: 14px; color: #86868b; }
         .data-val { font-size: 32px; font-weight: bold; color: #ff453a; font-family: monospace; }
         
+        /* 影像來源切換 */
+        .source-switch { display: flex; gap: 8px; margin-bottom: 10px; }
+        .src-btn {
+            flex: 1;
+            padding: 9px;
+            font-size: 14px;
+            font-weight: bold;
+            border: 1px solid #d2d2d7;
+            border-radius: 8px;
+            background: white;
+            color: #1d1d1f;
+            cursor: pointer;
+        }
+        .src-btn.active { background: #1d1d1f; color: white; border-color: #1d1d1f; }
+
         /* 取樣間隔滑桿 */
         .sample-rate {
             display: flex;
@@ -168,7 +183,13 @@
 
 <div class="container">
     <h2>🔥 PROBAT 烘豆曲線觀測</h2>
-    
+
+    <div class="source-switch">
+        <button id="src-camera" class="src-btn">📷 相機</button>
+        <button id="src-file" class="src-btn">🎬 讀取影片檔</button>
+        <input type="file" id="video-file-input" accept="video/*" style="display:none">
+    </div>
+
     <div class="camera-wrapper">
         <video id="video" autoplay playsinline></video>
         <div class="roi-container">
@@ -342,32 +363,97 @@
     }
     document.querySelectorAll('.roi-box').forEach(makeAdjustable);
 
-    // 2. 影像來源：預設啟動手機後置鏡頭；
-    //    加上 ?source=mp4 參數（或相機不可用時）改讀取本地 video.mp4 進行驗證
-    function useTestVideo() {
-        video.srcObject = null;
-        video.src = 'video.mp4';
-        video.muted = true;   // 靜音才允許自動播放
-        video.loop = true;
-        video.play().catch(err => console.error('video.mp4 播放失敗:', err));
+    // 2. 影像來源管理：相機／影片檔 兩種模式，可隨時切換
+    const srcCameraBtn = document.getElementById('src-camera');
+    const srcFileBtn = document.getElementById('src-file');
+    const videoFileInput = document.getElementById('video-file-input');
+    let cameraStream = null;
+    let fileObjectUrl = null;
+
+    function setActiveSource(btn) {
+        srcCameraBtn.classList.toggle('active', btn === srcCameraBtn);
+        srcFileBtn.classList.toggle('active', btn === srcFileBtn);
     }
 
-    const useMp4 = new URLSearchParams(location.search).get('source') === 'mp4';
-    if (useMp4 || !navigator.mediaDevices) {
-        useTestVideo();
-    } else {
+    // 切換來源時：釋放舊來源（關相機、回收物件 URL）並重置辨識狀態
+    function stopCurrentSource() {
+        if (cameraStream) {
+            cameraStream.getTracks().forEach(t => t.stop());
+            cameraStream = null;
+        }
+        if (fileObjectUrl) {
+            URL.revokeObjectURL(fileObjectUrl);
+            fileObjectUrl = null;
+        }
+        video.srcObject = null;
+        video.removeAttribute('src');
+        resetRecognition();
+    }
+
+    function resetRecognition() {
+        currentTemp = null;
+        readings.length = 0;
+        slots.length = 0;
+        firstReadTick = null;
+        lastAcceptTick = null;
+        mismatchStreak = 0;
+        refinedRoi = null;
+        refinedAge = 99;
+        displayTemp.innerText = '--.- °C';
+    }
+
+    function useCamera() {
+        stopCurrentSource();
+        setActiveSource(srcCameraBtn);
+        if (!navigator.mediaDevices) {
+            ocrRaw.innerText = '此環境無相機可用，請改用「讀取影片檔」';
+            return;
+        }
         navigator.mediaDevices.getUserMedia({
             video: { facingMode: { exact: "environment" } },
             audio: false
         }).then(stream => {
+            cameraStream = stream;
             video.srcObject = stream;
-        }).catch(err => {
+        }).catch(() => {
             // 若環境不支援強行指定後鏡頭（如電腦測試），則彈性獲取
-            navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
-                     .then(s => video.srcObject = s)
-                     .catch(useTestVideo); // 完全無相機時退回 video.mp4
+            navigator.mediaDevices.getUserMedia({ video: true })
+                .then(s => { cameraStream = s; video.srcObject = s; })
+                .catch(err => {
+                    console.error('無法開啟相機:', err);
+                    ocrRaw.innerText = '無法開啟相機（' + err.name + '），請改用「讀取影片檔」';
+                });
         });
     }
+
+    function playVideoSrc(src) {
+        video.src = src;
+        video.muted = true;   // 靜音才允許自動播放
+        video.loop = true;
+        video.play().catch(err => console.error('影片播放失敗:', err));
+    }
+
+    function useVideoFile(file) {
+        stopCurrentSource();
+        setActiveSource(srcFileBtn);
+        fileObjectUrl = URL.createObjectURL(file);
+        playVideoSrc(fileObjectUrl);
+    }
+
+    function useDemoVideo() {
+        stopCurrentSource();
+        setActiveSource(srcFileBtn);
+        playVideoSrc('video.mp4');
+    }
+
+    srcCameraBtn.addEventListener('click', useCamera);
+    srcFileBtn.addEventListener('click', () => videoFileInput.click());
+    videoFileInput.addEventListener('change', () => {
+        if (videoFileInput.files.length) useVideoFile(videoFileInput.files[0]);
+        videoFileInput.value = ''; // 允許重選同一檔案
+    });
+
+    // （初始來源選擇在腳本最尾端執行，確保所有辨識狀態變數已宣告）
 
     // 3. 影像處理與七段 LED 數字辨識
     //    流程：擷取溫度紅框 → 過濾紅色像素 → 直欄投影切出字元 →
@@ -927,6 +1013,13 @@
         link.click();
         document.body.removeChild(link);
     });
+
+    // 初始來源：?source=mp4 載入示範影片，否則預設開相機
+    if (new URLSearchParams(location.search).get('source') === 'mp4') {
+        useDemoVideo();
+    } else {
+        useCamera();
+    }
 </script>
 </body>
 </html>
