@@ -656,6 +656,9 @@
     }
 
     let tick = 0;
+    let firstReadTick = null; // 第一筆成功讀值的 tick（初始鎖定暖機期用）
+    const WARMUP_TICKS = 25;  // 暖機 5 秒：收集夠多讀值再做初始鎖定，
+                              // 避免搶先鎖到變暗期的殘缺讀值（153.8 讀成 53.8）
     setInterval(() => {
         if (video.readyState !== video.HAVE_ENOUGH_DATA || !video.videoWidth) return;
         procCanvas.width = video.videoWidth;
@@ -669,6 +672,7 @@
 
         const result = recognizeTemp();
         if (result) {
+            if (firstReadTick === null) firstReadTick = tick;
             const repaired = repairReading(result.value, result.raw);
             // hasDp：顯示器永遠帶一位小數，讀到小數點代表字形完整、品質高
             readings.push({ value: repaired, hasDp: result.raw.includes('.') });
@@ -684,9 +688,23 @@
         const voted = voteReadings();
         if (voted !== null) {
             if (currentTemp === null) {
-                // 初始鎖定門檻：至少 3 位數字且帶小數點，避免鎖到殘缺讀值
-                if (voted.numDigits >= 3 && voted.hasDp) { currentTemp = voted.value; mismatchStreak = 0; }
-            } else if (Math.abs(voted.value - currentTemp) <= 20) {
+                // 初始鎖定：至少 3 位數字、帶小數點，且暖機期已過——
+                // 暖機期間投票機制會自然讓位數多的桶（153.8）壓過殘缺桶（53.8）
+                if (voted.numDigits >= 3 && voted.hasDp
+                    && firstReadTick !== null && tick - firstReadTick >= WARMUP_TICKS) {
+                    currentTemp = voted.value;
+                    mismatchStreak = 0;
+                }
+            } else if (Math.abs(voted.value - currentTemp) <= (voted.hasDp ? 20 : 6)) {
+                // 追蹤更新：帶小數點的完整讀值容許 ±20；
+                // 殘缺讀值只容許 ±6（烘豆溫度每秒最多變化約 0.5°C）
+                currentTemp = voted.value;
+                mismatchStreak = 0;
+            } else if (voted.hasDp
+                       && (Math.abs(voted.value - (currentTemp + 100)) <= 20
+                           || Math.abs(voted.value - (currentTemp + 200)) <= 20)) {
+                // 向上 +100/+200 立即修正：若目前鎖在漏掉百位的低值（53.8），
+                // 出現完整讀值（153.8）時馬上跳上去——憑空多出一位數幾乎不可能
                 currentTemp = voted.value;
                 mismatchStreak = 0;
             } else if (voted.hasDp && ++mismatchStreak >= 8) {
