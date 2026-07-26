@@ -5,6 +5,597 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PROBAT 烘豆溫度曲線觀測器</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+/*
+ * led-core.js — 七段 LED 判讀核心（純 JavaScript，零相依）
+ *
+ * 與 led_temp.py 同一套演算法，逐項對應移植：
+ *   1. 自動找出畫面上的顯示器（橫向投影切列帶 -> 連通元件濾掉圓點 -> 縱向切開並排的顯示器）
+ *   2. 在顯示器旁自動挑一塊面板當追蹤模板（要求比對峰值高且唯一）
+ *   3. 用金字塔式模板比對追蹤位移，把 ROI 對齊到參考座標
+ *   4. ★ 對齊後多格取最大值合成 —— 補滿 LED 掃描造成的缺筆劃
+ *      （沒對齊就疊加會糊掉，先對齊再疊加才成立）
+ *   5. 自動量測傾斜量並扶正（不扶正的話右下段 c 幾乎讀不到）
+ *   6. 暴力搜尋字距與相位，目標函數 =「能解出多少合法數字」+ 取樣餘裕
+ *
+ * 瀏覽器與 Node 都可用。瀏覽器端傳入的就是 canvas 的 ImageData.data。
+ */
+(function (root) {
+  'use strict';
+
+  var LIT = 60;        // 合成影像上判定發光的門檻
+  var RED_MIN = 85;    // 紅色通道下限，濾掉暗紅反光（手機預覽偏暗，放寬）
+
+  // 每一段在字框內的相對位置 [名稱, x0, x1, y0, y1]
+  var SEGBOX = [
+    ['a', 0.28, 0.72, 0.02, 0.16], ['b', 0.74, 1.00, 0.15, 0.45],
+    ['c', 0.74, 1.00, 0.55, 0.85], ['d', 0.28, 0.72, 0.84, 0.98],
+    ['e', 0.00, 0.26, 0.55, 0.85], ['f', 0.00, 0.26, 0.15, 0.45],
+    ['g', 0.28, 0.72, 0.43, 0.57]
+  ];
+  var TABLE = {
+    abcdef: '0', bc: '1', abdeg: '2', abcdg: '3', bcfg: '4',
+    acdfg: '5', acdefg: '6', abc: '7', abcdefg: '8', abcdfg: '9'
+  };
+
+  // ------------------------------------------------------------ 基本影像運算
+
+  /**
+   * 紅色發光強度：紅通道超出綠、藍的量，並依當幀亮度正規化。
+   *
+   * 正規化是關鍵：手機即時預覽的曝光會一直變（LED 掃描變暗時整幀跟著暗），
+   * 寫死門檻在錄好的影片上沒問題，在相機上會忽亮忽暗導致辨識率掉。
+   * 取 99.5 百分位當「這一幀最亮的紅」拉到固定值，下游所有固定門檻
+   * 就等效於「相對亮度門檻」。太暗的一幀直接視為全暗，避免把雜訊放大成訊號。
+   */
+  function redness(rgba, w, h, redMin) {
+    redMin = redMin === undefined ? RED_MIN : redMin;
+    var n = w * h, out = new Uint8Array(n), hist = new Int32Array(256), i;
+    for (i = 0; i < n; i++) {
+      var r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
+      if (r <= redMin) { hist[0]++; continue; }
+      var v = Math.min(r - g, r - b);
+      v = v < 0 ? 0 : (v > 255 ? 255 : v);
+      out[i] = v; hist[v]++;
+    }
+    var target = n * 0.005, acc = 0, p995 = 0;
+    for (var k = 255; k >= 0; k--) { acc += hist[k]; if (acc >= target) { p995 = k; break; } }
+    if (p995 < 40) return new Uint8Array(n);      // 這一幀沒有夠亮的紅色
+    var gain = Math.min(200 / p995, 4);
+    if (Math.abs(gain - 1) > 0.02)
+      for (i = 0; i < n; i++) { var t = out[i] * gain; out[i] = t > 255 ? 255 : t; }
+    return out;
+  }
+
+  function grayscale(rgba, w, h) {
+    var out = new Uint8Array(w * h);
+    for (var i = 0, n = w * h; i < n; i++)
+      out[i] = (rgba[i * 4] * 77 + rgba[i * 4 + 1] * 150 + rgba[i * 4 + 2] * 29) >> 8;
+    return out;
+  }
+
+  /** 逐格取最大值：補滿 LED 掃描造成的缺筆劃 */
+  function maxComposite(masks) {
+    var out = new Uint8Array(masks[0].length);
+    for (var k = 0; k < masks.length; k++) {
+      var m = masks[k];
+      for (var i = 0; i < out.length; i++) if (m[i] > out[i]) out[i] = m[i];
+    }
+    return out;
+  }
+
+  /** 扶正斜體：dst(u,v) = src(u + s*v - s*h/2, v) */
+  function deskew(mask, w, h, s) {
+    if (!s) return mask;
+    var out = new Uint8Array(w * h), t = s * h / 2;
+    for (var v = 0; v < h; v++) {
+      var fx = s * v - t, row = v * w;
+      var x0 = Math.floor(fx), fr = fx - x0;
+      for (var u = 0; u < w; u++) {
+        var a = u + x0, b = a + 1;
+        var va = (a >= 0 && a < w) ? mask[row + a] : 0;
+        var vb = (b >= 0 && b < w) ? mask[row + b] : 0;
+        out[row + u] = (va + (vb - va) * fr) | 0;
+      }
+    }
+    return out;
+  }
+
+  /** 二值化後的積分圖，讓每個取樣框都能 O(1) 求平均 */
+  function integral(mask, w, h) {
+    var ii = new Int32Array((w + 1) * (h + 1));
+    for (var y = 0; y < h; y++) {
+      var run = 0;
+      for (var x = 0; x < w; x++) {
+        run += mask[y * w + x] > LIT ? 1 : 0;
+        ii[(y + 1) * (w + 1) + x + 1] = ii[y * (w + 1) + x + 1] + run;
+      }
+    }
+    return ii;
+  }
+
+  function rectMean(ii, w, h, x0, y0, x1, y1) {
+    x0 = Math.max(x0 | 0, 0); y0 = Math.max(y0 | 0, 0);
+    x1 = Math.min(x1 | 0, w); y1 = Math.min(y1 | 0, h);
+    if (x1 <= x0 || y1 <= y0) return 0;
+    var W = w + 1;
+    var s = ii[y1 * W + x1] - ii[y0 * W + x1] - ii[y1 * W + x0] + ii[y0 * W + x0];
+    return s / ((x1 - x0) * (y1 - y0));
+  }
+
+  // --------------------------------------------------------- 連通元件（BFS）
+
+  /** 回傳 {n, label, stats:[{x0,y0,x1,y1,area}]} */
+  function components(bin, w, h) {
+    var label = new Int32Array(w * h), stats = [], stack = [], cur = 0;
+    for (var s = 0; s < w * h; s++) {
+      if (!bin[s] || label[s]) continue;
+      cur++;
+      var x0 = w, x1 = -1, y0 = h, y1 = -1, area = 0;
+      stack.length = 0; stack.push(s); label[s] = cur;
+      while (stack.length) {
+        var p = stack.pop(), px = p % w, py = (p / w) | 0;
+        if (px < x0) x0 = px; if (px > x1) x1 = px;
+        if (py < y0) y0 = py; if (py > y1) y1 = py;
+        area++;
+        for (var dy = -1; dy <= 1; dy++)
+          for (var dx = -1; dx <= 1; dx++) {
+            var nx = px + dx, ny = py + dy;
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+            var q = ny * w + nx;
+            if (bin[q] && !label[q]) { label[q] = cur; stack.push(q); }
+          }
+      }
+      stats.push({ x0: x0, y0: y0, x1: x1, y1: y1, area: area, id: cur });
+    }
+    return { n: cur, label: label, stats: stats };
+  }
+
+  /** 只留下數字本體，去掉指示燈圓點、小數點這類小塊 */
+  function keepDigitBlobs(bin, w, h) {
+    var cc = components(bin, w, h);
+    if (!cc.stats.length) return bin;
+    var maxH = 0;
+    cc.stats.forEach(function (s) { maxH = Math.max(maxH, s.y1 - s.y0 + 1); });
+    var thr = 0.4 * maxH, out = new Uint8Array(w * h);
+    cc.stats.forEach(function (s) {
+      if (s.y1 - s.y0 + 1 >= thr && s.area >= 20)
+        for (var i = 0; i < out.length; i++) if (cc.label[i] === s.id) out[i] = 1;
+    });
+    return out;
+  }
+
+  // ------------------------------------------------------ 找出畫面上的顯示器
+
+  /**
+   * 在紅色遮罩上找出「一排七段數字」的候選區域。
+   * 先橫向投影切出列帶，再在列帶內縱向切開 —— 同一高度上可能並排兩台顯示器
+   * （計時器與溫度），不切開就會被當成同一個。
+   */
+  function findDisplays(mask, w, h) {
+    var bin = new Uint8Array(w * h);
+    for (var i = 0; i < bin.length; i++) bin[i] = mask[i] > LIT ? 1 : 0;
+
+    var rows = new Int32Array(h);
+    for (var y = 0; y < h; y++) {
+      var c = 0;
+      for (var x = 0; x < w; x++) c += bin[y * w + x];
+      rows[y] = c;
+    }
+    var bands = [], yy = 0;
+    while (yy < h) {
+      if (!rows[yy]) { yy++; continue; }
+      var y1 = yy, gap = 0;
+      while (y1 + 1 < h && gap <= 3) { y1++; gap = rows[y1] ? 0 : gap + 1; }
+      y1 -= gap;
+      if (y1 - yy + 1 >= 18 && y1 - yy + 1 <= 200) bands.push([yy, y1]);
+      yy = y1 + 1;
+    }
+
+    var out = [];
+    bands.forEach(function (bd) {
+      var by0 = bd[0], by1 = bd[1], bh = by1 - by0 + 1;
+      var sub = new Uint8Array(w * bh);
+      for (var y = 0; y < bh; y++)
+        for (var x = 0; x < w; x++) sub[y * w + x] = bin[(by0 + y) * w + x];
+      var keep = keepDigitBlobs(sub, w, bh);
+      var cols = new Int32Array(w);
+      for (var x2 = 0; x2 < w; x2++) {
+        var c2 = 0;
+        for (var y2 = 0; y2 < bh; y2++) c2 += keep[y2 * w + x2];
+        cols[x2] = c2;
+      }
+      var maxGap = (1.5 * bh) | 0, x3 = 0;
+      while (x3 < w) {
+        if (!cols[x3]) { x3++; continue; }
+        var x4 = x3, g2 = 0;
+        while (x4 + 1 < w && g2 <= maxGap) { x4++; g2 = cols[x4] ? 0 : g2 + 1; }
+        x4 -= g2;
+        var lit = 0;
+        for (var x5 = x3; x5 <= x4; x5++) lit += cols[x5];
+        if (x4 - x3 + 1 >= 1.2 * bh && lit >= 4 * bh)
+          out.push({ x0: x3, y0: by0, x1: x4, y1: by1 });
+        x3 = x4 + 1;
+      }
+    });
+    return out;
+  }
+
+  // ----------------------------------------------------------- 模板比對追蹤
+
+  /** ZNCC：與 OpenCV 的 TM_CCOEFF_NORMED 同一個定義 */
+  function znccAt(img, iw, tpl, tw, th, ox, oy, tMean, tNorm) {
+    var sum = 0, sum2 = 0, dot = 0, n = tw * th;
+    for (var y = 0; y < th; y++) {
+      var ir = (oy + y) * iw + ox, tr = y * tw;
+      for (var x = 0; x < tw; x++) {
+        var v = img[ir + x];
+        sum += v; sum2 += v * v; dot += v * tpl[tr + x];
+      }
+    }
+    var mean = sum / n;
+    var num = dot - mean * tMean * n;
+    var den = Math.sqrt(Math.max(sum2 - sum * sum / n, 1e-6)) * tNorm;
+    return den > 0 ? num / den : -1;
+  }
+
+  function tplStats(tpl) {
+    var sum = 0, sum2 = 0, n = tpl.length;
+    for (var i = 0; i < n; i++) { sum += tpl[i]; sum2 += tpl[i] * tpl[i]; }
+    var mean = sum / n;
+    return { mean: mean, norm: Math.sqrt(Math.max(sum2 - sum * sum / n, 1e-6)) };
+  }
+
+  /** 在指定矩形範圍內搜尋最佳位置 */
+  function searchBox(img, iw, ih, tpl, tw, th, x0, y0, x1, y1, step) {
+    var st = tplStats(tpl), best = { score: -2, x: 0, y: 0 };
+    x0 = Math.max(x0, 0); y0 = Math.max(y0, 0);
+    x1 = Math.min(x1, iw - tw); y1 = Math.min(y1, ih - th);
+    for (var y = y0; y <= y1; y += step)
+      for (var x = x0; x <= x1; x += step) {
+        var s = znccAt(img, iw, tpl, tw, th, x, y, st.mean, st.norm);
+        if (s > best.score) { best.score = s; best.x = x; best.y = y; }
+      }
+    return best;
+  }
+
+  function downsample(img, w, h, f) {
+    var dw = (w / f) | 0, dh = (h / f) | 0, out = new Uint8Array(dw * dh);
+    for (var y = 0; y < dh; y++)
+      for (var x = 0; x < dw; x++) out[y * dw + x] = img[(y * f) * w + x * f];
+    return { data: out, w: dw, h: dh };
+  }
+
+  /**
+   * 追蹤器：先在 1/4 解析度粗搜（快），再回到原解析度細修。
+   * 這是能在手機上即時跑的關鍵 —— 全解析度全域搜尋會慢上兩個數量級。
+   */
+  function Tracker(refGray, w, h, tplBox, opts) {
+    opts = opts || {};
+    this.iw = w; this.ih = h;
+    this.box = tplBox;
+    this.radius = opts.radius || 90;
+    this.f = opts.pyramid || 4;
+    var tw = tplBox.x1 - tplBox.x0, th = tplBox.y1 - tplBox.y0;
+    this.tw = tw; this.th = th;
+    this.tpl = new Uint8Array(tw * th);
+    for (var y = 0; y < th; y++)
+      for (var x = 0; x < tw; x++)
+        this.tpl[y * tw + x] = refGray[(tplBox.y0 + y) * w + tplBox.x0 + x];
+    var d = downsample(this.tpl, tw, th, this.f);
+    this.tplS = d.data; this.tsw = d.w; this.tsh = d.h;
+    var d2 = downsample(this.tpl, tw, th, 2);   // 快速追蹤用的半尺寸模板
+    this.tplH = d2.data; this.thw = d2.w; this.thh = d2.h;
+    this.last = { x: tplBox.x0, y: tplBox.y0 };
+  }
+
+  /**
+   * fast=true 時只在上一格位置附近做微幅搜尋。
+   * 以原生張數擷取時，相鄰兩格之間位移只有 1~2 px，不需要每格都全域重找；
+   * 全域搜尋每格要好幾毫秒，30fps 下會吃掉太多主執行緒時間。
+   */
+  Tracker.prototype.locate = function (gray, fast) {
+    var f = this.f;
+    if (fast && this.last) {
+      var sm = downsample(gray, this.iw, this.ih, 2);
+      var hx = Math.round(this.last.x / 2), hy = Math.round(this.last.y / 2);
+      var coarse2 = searchBox(sm.data, sm.w, sm.h, this.tplH, this.thw, this.thh,
+                              hx - 3, hy - 3, hx + 3, hy + 3, 1);
+      if (coarse2.score >= 0.50) {
+        var fine2 = searchBox(gray, this.iw, this.ih, this.tpl, this.tw, this.th,
+                              coarse2.x * 2 - 2, coarse2.y * 2 - 2,
+                              coarse2.x * 2 + 2, coarse2.y * 2 + 2, 1);
+        if (fine2.score >= 0.45) {
+          this.last = { x: fine2.x, y: fine2.y };
+          return fine2;
+        }
+      }
+    }
+    var small = downsample(gray, this.iw, this.ih, f);
+    var r = Math.ceil(this.radius / f);
+    var cx = Math.round(this.last.x / f), cy = Math.round(this.last.y / f);
+    var coarse = searchBox(small.data, small.w, small.h, this.tplS, this.tsw, this.tsh,
+                           cx - r, cy - r, cx + r, cy + r, 1);
+    var gx = coarse.x * f, gy = coarse.y * f;
+    var fine = searchBox(gray, this.iw, this.ih, this.tpl, this.tw, this.th,
+                         gx - f, gy - f, gx + f, gy + f, 1);
+    this.last = { x: fine.x, y: fine.y };
+    return { score: fine.score, x: fine.x, y: fine.y };
+  };
+
+  /** 依追蹤結果把 ROI 取樣回參考座標（固定大小，超出畫面補黑） */
+  Tracker.prototype.warpRoi = function (rgba, roi, loc) {
+    var w = this.iw, h = this.ih;
+    var tx = loc.x + (roi.x - this.box.x0), ty = loc.y + (roi.y - this.box.y0);
+    var out = new Uint8Array(roi.w * roi.h * 4);
+    for (var v = 0; v < roi.h; v++) {
+      var sy = ty + v;
+      if (sy < 0 || sy >= h) continue;
+      for (var u = 0; u < roi.w; u++) {
+        var sx = tx + u;
+        if (sx < 0 || sx >= w) continue;
+        var si = (sy * w + sx) * 4, di = (v * roi.w + u) * 4;
+        out[di] = rgba[si]; out[di + 1] = rgba[si + 1]; out[di + 2] = rgba[si + 2];
+      }
+    }
+    return out;
+  };
+
+  /**
+   * 在顯示器周圍挑追蹤模板。好的模板要「峰值高」且「峰值唯一」——
+   * 面板上有兩台外觀相同的控制器，模板不夠獨特就會鎖錯台。
+   */
+  /** 搜尋並回傳最佳位置與「排除峰值鄰域後的次高分」，用來評估唯一性 */
+  function searchWithSecond(img, iw, ih, tpl, tw, th, step, excl) {
+    var st = tplStats(tpl), best = { score: -2, x: 0, y: 0 }, second = -2, scores = [];
+    for (var y = 0; y <= ih - th; y += step)
+      for (var x = 0; x <= iw - tw; x += step) {
+        var sc = znccAt(img, iw, tpl, tw, th, x, y, st.mean, st.norm);
+        scores.push([sc, x, y]);
+        if (sc > best.score) { best.score = sc; best.x = x; best.y = y; }
+      }
+    for (var i = 0; i < scores.length; i++)
+      if (Math.abs(scores[i][1] - best.x) > excl || Math.abs(scores[i][2] - best.y) > excl)
+        if (scores[i][0] > second) second = scores[i][0];
+    best.second = second;
+    return best;
+  }
+
+  /**
+   * 在顯示器周圍挑追蹤模板。好的模板要「峰值高」且「峰值唯一」——
+   * 面板上有兩台外觀相同的控制器，模板不夠獨特就會鎖錯台。
+   *
+   * 全部在 1/4 解析度上比較（只是要選出哪一塊比較好追，不需要精度），
+   * 選定後才在原解析度細修一次。全解析度暴搜五個候選要花好幾秒，
+   * 在手機上會直接把主執行緒卡死。
+   */
+  function pickTemplate(refGray, laterGray, w, h, box) {
+    var F = 4;
+    var later = downsample(laterGray, w, h, F);
+    var bw = box.x1 - box.x0 + 1, bh = box.y1 - box.y0 + 1;
+    var cands = [
+      [box.x0 - 0.2 * bw, box.y1 + 0.15 * bh, box.x1 + 0.2 * bw, box.y1 + 1.3 * bh],
+      [box.x0 - 0.2 * bw, box.y0 - 1.3 * bh, box.x1 + 0.2 * bw, box.y0 - 0.15 * bh],
+      [box.x0 - 0.2 * bw, box.y1 + 0.6 * bh, box.x1 + 0.2 * bw, box.y1 + 2.0 * bh],
+      [box.x0 - 1.1 * bw, box.y0 - 0.3 * bh, box.x0 - 0.1 * bw, box.y1 + 0.3 * bh],
+      [box.x1 + 0.1 * bw, box.y0 - 0.3 * bh, box.x1 + 1.1 * bw, box.y1 + 0.3 * bh]
+    ];
+    var best = null;
+    cands.forEach(function (c) {
+      var x0 = Math.max(c[0] | 0, 0), y0 = Math.max(c[1] | 0, 0);
+      var x1 = Math.min(c[2] | 0, w - 1), y1 = Math.min(c[3] | 0, h - 1);
+      var tw = x1 - x0, th = y1 - y0;
+      if (tw < 60 || th < 30) return;
+      var tpl = new Uint8Array(tw * th), sum = 0, sum2 = 0;
+      for (var y = 0; y < th; y++)
+        for (var x = 0; x < tw; x++) {
+          var v = refGray[(y0 + y) * w + x0 + x];
+          tpl[y * tw + x] = v; sum += v; sum2 += v * v;
+        }
+      var std = Math.sqrt(sum2 / (tw * th) - Math.pow(sum / (tw * th), 2));
+      if (std < 12) return;                       // 一整片平坦，無法追蹤
+      var ds = downsample(tpl, tw, th, F);
+      if (ds.w < 8 || ds.h < 6) return;
+      var hit = searchWithSecond(later.data, later.w, later.h, ds.data, ds.w, ds.h, 1, 6);
+      if (Math.abs(hit.x * F - x0) + Math.abs(hit.y * F - y0) > 80) return;
+      var score = hit.score + (hit.score - hit.second);
+      if (!best || score > best.score)
+        best = { score: score, peak: hit.score, unique: hit.score - hit.second,
+                 box: { x0: x0, y0: y0, x1: x1, y1: y1 } };
+    });
+    return best;
+  }
+
+  // ------------------------------------------------------------------ 解碼
+
+  /** 回傳 [字元, 判讀餘裕]；餘裕 = 最暗的亮段 - 最亮的暗段 */
+  function decodeAt(ii, w, h, cx, cal) {
+    var fills = [], on = [];
+    for (var i = 0; i < SEGBOX.length; i++) {
+      var sb = SEGBOX[i];
+      var v = rectMean(ii, w, h,
+        cx + sb[1] * cal.cellW, cal.y0 + sb[3] * cal.cellH,
+        cx + sb[2] * cal.cellW, cal.y0 + sb[4] * cal.cellH);
+      fills.push(v);
+      if (v > cal.segOn) on.push(sb[0]);
+    }
+    if (!on.length) return [' ', 0];
+    var ch = TABLE[on.slice().sort().join('')] || '?';
+    if (ch === '?') return ['?', 0];
+    var hi = Infinity, lo = 0;
+    for (var k = 0; k < SEGBOX.length; k++) {
+      if (on.indexOf(SEGBOX[k][0]) >= 0) hi = Math.min(hi, fills[k]);
+      else lo = Math.max(lo, fills[k]);
+    }
+    return [ch, hi - lo];
+  }
+
+  function decodeAll(mask, w, h, cal) {
+    var ii = integral(mask, w, h), s = '';
+    for (var k = 0; k < cal.nCells; k++)
+      s += decodeAt(ii, w, h, cal.x0 + cal.pitch * k, cal)[0];
+    return s;
+  }
+
+  // -------------------------------------------------------------- 幾何校準
+
+  /** 掃描傾斜量，取讓垂直筆劃最集中（欄投影最尖銳）的那一個。由粗到細兩輪。 */
+  function estimateShear(mask, w, h) {
+    function sharp(s) {
+      var d = deskew(mask, w, h, s), sum = 0, sq = 0;
+      for (var x = 0; x < w; x++) {
+        var c = 0;
+        for (var y = 0; y < h; y++) if (d[y * w + x] > LIT) c++;
+        sum += c; sq += c * c;
+      }
+      return sum > 0 ? sq / (sum * sum) : 0;
+    }
+    var best = 0, bestScore = -1, s;
+    for (s = -0.40; s <= 0.101; s += 0.02) {
+      var v = sharp(s);
+      if (v > bestScore) { bestScore = v; best = s; }
+    }
+    for (s = best - 0.02; s <= best + 0.0201; s += 0.005) {
+      var v2 = sharp(s);
+      if (v2 > bestScore) { bestScore = v2; best = s; }
+    }
+    return Math.round(best * 1000) / 1000;
+  }
+
+  /**
+   * 暴力搜尋字距與相位。以右邊緣對齊為基礎：七段數字的 b、c 段永遠貼在
+   * 字格右側，連「1」也是，所以右邊緣跨數字一定對齊，左邊緣不會。
+   * 目標函數 =「解得出幾個合法數字」，同分再比取樣餘裕。
+   */
+  function fitGrid(comps, w, h, cal) {
+    var iis = comps.map(function (m) { return integral(m, w, h); });
+    var tops = [], bots = [], lefts = [], rights = [];
+    comps.forEach(function (m) {
+      var bin = new Uint8Array(w * h);
+      for (var i = 0; i < bin.length; i++) bin[i] = m[i] > LIT ? 1 : 0;
+      var keep = keepDigitBlobs(bin, w, h);
+      var t = -1, b = -1, l = -1, r = -1;
+      for (var y = 0; y < h; y++)
+        for (var x = 0; x < w; x++)
+          if (keep[y * w + x]) {
+            if (t < 0) t = y;
+            b = y;
+            if (l < 0 || x < l) l = x;
+            if (x > r) r = x;
+          }
+      if (t >= 0) { tops.push(t); bots.push(b); lefts.push(l); rights.push(r); }
+    });
+    if (!tops.length) return null;
+    var med = function (a) { a = a.slice().sort(function (p, q) { return p - q; });
+                             return a[a.length >> 1]; };
+    cal.y0 = med(tops);
+    cal.cellH = med(bots) - cal.y0 + 1;
+    var left = med(lefts), right = med(rights), best = null;
+
+    for (var pitch = 0.60 * cal.cellH; pitch < 1.35 * cal.cellH; pitch += 1) {
+      var wfs = [0.74, 0.82, 0.90];
+      for (var wi = 0; wi < wfs.length; wi++) {
+        var cw = Math.round(wfs[wi] * pitch);
+        for (var last = right - cw - 4; last <= right - cw + 4; last++) {
+          var n = Math.round((last - left) / pitch) + 1;
+          if (n < 1 || n > 6) continue;
+          cal.pitch = pitch; cal.cellW = cw; cal.nCells = n;
+          cal.x0 = last - (n - 1) * pitch;
+          var good = 0, amb = 0, margin = 0;
+          for (var q = 0; q < iis.length; q++)
+            for (var k = 0; k < n; k++) {
+              var d = decodeAt(iis[q], w, h, cal.x0 + pitch * k, cal);
+              if (d[0] !== '?' && d[0] !== ' ') good++;
+              if (d[0] === '?') amb++;
+              margin += d[1];
+            }
+          var score = good - 0.7 * amb + 0.5 * margin;
+          if (!best || score > best.score)
+            best = { score: score, pitch: pitch, cellW: cw, nCells: n, x0: cal.x0 };
+        }
+      }
+    }
+    if (!best) return null;
+    cal.pitch = best.pitch; cal.cellW = best.cellW;
+    cal.nCells = best.nCells; cal.x0 = best.x0;
+    // 左邊多留一格：讀數掉到三位數以下時，最高位會整格暗掉
+    if (cal.x0 - cal.pitch >= 0) { cal.x0 -= cal.pitch; cal.nCells += 1; }
+    return best.score;
+  }
+
+  /** 掃亮度門檻；多個同樣好時取中間值，落在容忍區間正中央最穩 */
+  function tuneSegOn(comps, w, h, cal) {
+    var iis = comps.map(function (m) { return integral(m, w, h); });
+    var cands = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45], scores = [];
+    cands.forEach(function (th) {
+      cal.segOn = th;
+      var good = 0, amb = 0;
+      for (var q = 0; q < iis.length; q++)
+        for (var k = 0; k < cal.nCells; k++) {
+          var d = decodeAt(iis[q], w, h, cal.x0 + cal.pitch * k, cal);
+          if (d[0] !== '?' && d[0] !== ' ') good++;
+          if (d[0] === '?') amb++;
+        }
+      scores.push(good - 0.7 * amb);
+    });
+    var top = Math.max.apply(null, scores);
+    var ok = cands.filter(function (t, i) { return scores[i] >= top - 0.5; });
+    cal.segOn = ok[ok.length >> 1];
+    return top;
+  }
+
+  /**
+   * 一次取樣的完整判讀。
+   * 整數位用合成影像（疊愈多格筆劃愈完整）；最後一位變化快，改用單格多數決，
+   * 否則合成會把前後兩個不同的讀數疊在一起 —— 這是末位判讀準確的關鍵。
+   *
+   * frameMasks: 已對齊、已扶正的連續影格遮罩，取樣時刻位於正中間。
+   */
+  function readSample(frameMasks, w, h, cal) {
+    var mid = frameMasks.length >> 1, digits = [], halves = [1, 2, 3, 4, 5, 6];
+    for (var k = 0; k < cal.nCells; k++) {
+      var got = '?';
+      for (var hi = 0; hi < halves.length; hi++) {
+        var half = halves[hi];
+        var sel = frameMasks.slice(Math.max(mid - half, 0), mid + half + 1);
+        var d = decodeAt(integral(maxComposite(sel), w, h), w, h,
+                         cal.x0 + cal.pitch * k, cal)[0];
+        if (d !== '?' && d !== ' ') { got = d; break; }
+        if (d === ' ' && half >= 3) { got = ' '; break; }
+      }
+      digits.push(got);
+    }
+    var votes = {}, lastX = cal.x0 + cal.pitch * (cal.nCells - 1);
+    frameMasks.forEach(function (m) {
+      var d = decodeAt(integral(m, w, h), w, h, lastX, cal)[0];
+      if (d !== '?' && d !== ' ') votes[d] = (votes[d] || 0) + 1;
+    });
+    var top = 0;
+    Object.keys(votes).forEach(function (d) { top = Math.max(top, votes[d]); });
+    var cands = Object.keys(votes).filter(function (d) { return votes[d] === top; }).sort();
+    if (cands.length) digits[digits.length - 1] = cands[0];
+    return { raw: digits.join(''), candidates: cands };
+  }
+
+  function toValue(s, decimals) {
+    s = s.trim();
+    if (!s || s.indexOf('?') >= 0) return null;
+    var v = parseInt(s, 10);
+    return isNaN(v) ? null : v / Math.pow(10, decimals);
+  }
+
+  root.LedCore = {
+    LIT: LIT, RED_MIN: RED_MIN, SEGBOX: SEGBOX, TABLE: TABLE,
+    redness: redness, grayscale: grayscale, maxComposite: maxComposite,
+    deskew: deskew, integral: integral, rectMean: rectMean,
+    components: components, keepDigitBlobs: keepDigitBlobs,
+    findDisplays: findDisplays, pickTemplate: pickTemplate, Tracker: Tracker,
+    searchWithSecond: searchWithSecond,
+    decodeAt: decodeAt, decodeAll: decodeAll, estimateShear: estimateShear,
+    fitGrid: fitGrid, tuneSegOn: tuneSegOn, readSample: readSample, toValue: toValue
+  };
+})(typeof module !== 'undefined' && module.exports ? module.exports : window);
+    </script>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -206,6 +797,28 @@
         #start-btn:disabled { background-color: #aeaeb2; }
         #stop-btn { background-color: #ff3b30; color: white; }
         #stop-btn:disabled { background-color: #aeaeb2; }
+        #crack-btn { background-color: #ff9500; color: white; }
+        #crack-btn:disabled { background-color: #aeaeb2; }
+        #drop-btn { background-color: #6f4e37; color: white; }
+        #drop-btn:disabled { background-color: #aeaeb2; }
+        .btn-group.marks button { font-size: 15px; padding: 10px; }
+        #confirm-overlay {
+            position: fixed; inset: 0; z-index: 100; padding: 20px;
+            background: rgba(0, 0, 0, 0.45);
+            display: none; align-items: center; justify-content: center;
+        }
+        #confirm-overlay.show { display: flex; }
+        .confirm-card {
+            background: #fff; border-radius: 14px; padding: 22px 20px;
+            width: 100%; max-width: 340px; box-shadow: 0 10px 40px rgba(0,0,0,.2);
+        }
+        .confirm-card h3 { margin: 0 0 8px; font-size: 18px; }
+        .confirm-card p { margin: 0 0 18px; font-size: 14px; color: #86868b; }
+        #load-btn { background-color: #e5e5ea; color: #1d1d1f; }
+        #load-btn:disabled { background-color: #f0f0f2; color: #aeaeb2; }
+        #load-msg { display: block; margin: -8px 0 15px; font-size: 13px; color: #86868b; }
+        #confirm-cancel { background-color: #e5e5ea; color: #1d1d1f; }
+        #confirm-ok { background-color: #ff3b30; color: white; }
         
         /* 圖表區域 */
         .chart-wrapper {
@@ -241,8 +854,7 @@
     <div class="camera-wrapper">
         <video id="video" autoplay playsinline></video>
         <div class="roi-container">
-            <div class="roi-box" id="roi-time" data-label="對準左邊時間"><div class="roi-handle"></div></div>
-            <div class="roi-box" id="roi-temp" data-label="對準右邊溫度"><div class="roi-handle"></div></div>
+            <div class="roi-box" id="roi-temp" data-label="對準溫度顯示器"><div class="roi-handle"></div></div>
             <div id="roi-auto"></div>
         </div>
     </div>
@@ -274,8 +886,30 @@
         <button id="stop-btn" disabled>停止並匯出</button>
     </div>
 
+    <div class="btn-group marks">
+        <button id="crack-btn" disabled>★ 1爆</button>
+        <button id="drop-btn" disabled>☕ 下豆</button>
+    </div>
+
+    <div class="btn-group">
+        <button id="load-btn">📂 讀取紀錄檔</button>
+    </div>
+    <span id="load-msg"></span>
+    <input type="file" id="csv-input" accept=".csv,text/csv" style="display:none">
+
     <div class="chart-wrapper">
         <canvas id="roastChart"></canvas>
+    </div>
+</div>
+
+<div id="confirm-overlay">
+    <div class="confirm-card">
+        <h3>確定要結束烘豆？</h3>
+        <p id="confirm-info">—</p>
+        <div class="btn-group">
+            <button id="confirm-cancel">取消</button>
+            <button id="confirm-ok">結束並匯出</button>
+        </div>
     </div>
 </div>
 
@@ -285,6 +919,8 @@
     const video = document.getElementById('video');
     const startBtn = document.getElementById('start-btn');
     const stopBtn = document.getElementById('stop-btn');
+    const crackBtn = document.getElementById('crack-btn');
+    const dropBtn = document.getElementById('drop-btn');
     const displayTime = document.getElementById('display-time');
     const displayTemp = document.getElementById('display-temp');
     const procCanvas = document.getElementById('processing-canvas');
@@ -297,6 +933,54 @@
     // 圖表數據陣列
     const timeLabels = [];
     const tempData = [];
+    // 咖啡豆圖示：Chart.js 的 pointStyle 除了內建形狀，也吃 Image / Canvas。
+    // 點陣圖照 devicePixelRatio 放大繪製、再以 px 尺寸顯示，高解析螢幕才不會糊。
+    function beanIcon(px) {
+        const dpr = Math.min(window.devicePixelRatio || 1, 3);
+        const c = document.createElement('canvas');
+        c.width = c.height = Math.round(px * dpr);
+        const g = c.getContext('2d');
+        g.scale(dpr, dpr);
+        g.translate(px / 2, px / 2);
+        g.rotate(-Math.PI / 5);                       // 稍微側躺，比較像實物
+        g.fillStyle = '#6f4e37';
+        g.beginPath();
+        g.ellipse(0, 0, px * 0.44, px * 0.30, 0, 0, Math.PI * 2);
+        g.fill();
+        g.strokeStyle = '#2f1e12';                    // 深色描邊，壓在橘色填色上才看得出輪廓
+        g.lineWidth = Math.max(px * 0.07, 1);
+        g.stroke();
+        g.strokeStyle = '#f0e2cf';                    // 中央那道溝
+        g.lineWidth = Math.max(px * 0.085, 1.2);
+        g.lineCap = 'round';
+        g.beginPath();
+        g.moveTo(-px * 0.34, px * 0.085);
+        g.bezierCurveTo(-px * 0.10, -px * 0.12, px * 0.10, px * 0.12, px * 0.34, -px * 0.085);
+        g.stroke();
+        const img = new Image(px, px);
+        // 圖片載入是非同步的，載好後補畫一次，否則第一次繪製時圖示還是空的
+        img.onload = () => { try { roastChart.update(); } catch (e) { /* 圖表尚未建立 */ } };
+        img.src = c.toDataURL();
+        return img;
+    }
+
+    // 事件標記：CSV 第三欄的符號 -> 名稱與圖上樣式。要新增標記在這裡加一行即可。
+    const MARK_TYPES = {
+        '*': { name: '一爆', style: 'star',       radius: 10, color: '#ff3b30' },
+        '#': { name: '下豆', style: beanIcon(22), radius: 12, color: '#6f4e37' }
+    };
+    const markData = [];      // 每個取樣點的標記字串，CSV 第三欄
+    const sampleSecs = [];    // 每個取樣點的經過秒數，用來把標記對到最近的點
+    let pendingMarks = [];    // 已按下但還沒歸到取樣點的標記
+
+    // 同一點若有多個標記，取後定義的那個當代表形狀
+    function markStyle(m) {
+        if (m) {
+            const keys = Object.keys(MARK_TYPES).filter(k => m.indexOf(k) >= 0);
+            if (keys.length) return MARK_TYPES[keys[keys.length - 1]];
+        }
+        return null;
+    }
 
     // 1. 初始化 Chart.js
     const ctx = document.getElementById('roastChart').getContext('2d');
@@ -311,11 +995,32 @@
                 backgroundColor: 'rgba(255, 149, 0, 0.1)',
                 borderWidth: 3,
                 tension: 0.2,
-                fill: true
+                fill: true,
+                // 有標記的點畫成紅色星星，其餘維持小圓點
+                pointStyle: c => (markStyle(markData[c.dataIndex]) || {}).style || 'circle',
+                pointRotation: c => (markStyle(markData[c.dataIndex]) || {}).rotation || 0,
+                pointRadius: c => (markStyle(markData[c.dataIndex]) || {}).radius || 3,
+                pointHoverRadius: c => ((markStyle(markData[c.dataIndex]) || {}).radius || 3) + 2,
+                pointBorderWidth: c => markStyle(markData[c.dataIndex]) ? 3 : 1,
+                pointBackgroundColor: c => (markStyle(markData[c.dataIndex]) || {}).color || '#ff9500',
+                pointBorderColor: c => (markStyle(markData[c.dataIndex]) || {}).color || '#ff9500'
             }]
         },
         options: {
             responsive: true,
+            plugins: {
+                tooltip: {
+                    callbacks: {
+                        afterLabel: c => {
+                            const m = markData[c.dataIndex];
+                            if (!m) return undefined;
+                            return Object.keys(MARK_TYPES)
+                                .filter(k => m.indexOf(k) >= 0)
+                                .map(k => MARK_TYPES[k].name).join('、');
+                        }
+                    }
+                }
+            },
             scales: {
                 x: { title: { display: true, text: '時間 (分:秒)' } },
                 y: { min: 20, max: 250, title: { display: true, text: '溫度 (°C)' } }
@@ -328,7 +1033,6 @@
     const cameraWrapper = document.querySelector('.camera-wrapper');
     const ROI_STORAGE_KEY = 'probat-roi-config';
     const ROI_DEFAULTS = {
-        'roi-time': { left: 10, top: 60, width: 34, height: 10 },
         'roi-temp': { left: 54, top: 60, width: 34, height: 10 }
     };
 
@@ -339,7 +1043,12 @@
             return {};
         }
     }
-    const roiConfig = Object.assign({}, ROI_DEFAULTS, loadRoiConfig());
+    // 只取仍存在的框，舊版存下來的 roi-time 設定直接忽略
+    const stored = loadRoiConfig();
+    const roiConfig = Object.assign({}, ROI_DEFAULTS);
+    Object.keys(ROI_DEFAULTS).forEach(id => {
+        if (stored[id]) roiConfig[id] = stored[id];
+    });
 
     function saveRoiConfig() {
         localStorage.setItem(ROI_STORAGE_KEY, JSON.stringify(roiConfig));
@@ -441,13 +1150,7 @@
 
     function resetRecognition() {
         currentTemp = null;
-        readings.length = 0;
-        slots.length = 0;
-        firstReadTick = null;
-        lastAcceptTick = null;
-        mismatchStreak = 0;
-        refinedRoi = null;
-        refinedAge = 99;
+        resetCore();                    // 清掉校準結果與影格緩衝，換來源後重新自動校準
         displayTemp.innerText = '--.- °C';
     }
 
@@ -622,110 +1325,57 @@
 
     // （初始來源選擇在腳本最尾端執行，確保所有辨識狀態變數已宣告）
 
-    // 3. 影像處理與七段 LED 數字辨識
-    //    流程：擷取溫度紅框 → 過濾紅色像素 → 直欄投影切出字元 →
-    //          七段區域取樣解碼 → 多數決濾波（解決掃描線閃爍缺字問題）
+    // 3. 影像處理與七段 LED 數字辨識（自動校準版）
+    //
+    //    與舊版最關鍵的差異：先對齊，再疊加。
+    //    舊版註解寫「多幀疊加會因手持晃動糊化，不採用」——那在沒有對齊的前提下
+    //    完全正確。但只要先用面板上不會變的區域做模板比對，把每一格對齊到同一
+    //    座標之後再取最大值疊起來，就不會糊，而且能補滿 LED 掃描(multiplex)造成
+    //    的缺筆劃。於是不必再丟棄不完整幀，也不必靠兩秒的多數決去重建讀值。
+    //
+    //    另外三件事改成開機時自動量測，不再寫死：
+    //      · 顯示器位置與字格幾何（字距、字寬、位數）
+    //      · 數字傾斜量（不扶正的話右下那一段 c 幾乎讀不到，整組解碼會失敗）
+    //      · 亮度門檻
+    //
+    //    演算法與 led_temp.py 相同，已在三支不同拍攝角度的影片上逐點驗證。
     const debugCanvas = document.getElementById('debug-canvas');
     const debugCtx = debugCanvas.getContext('2d');
     const ocrRaw = document.getElementById('ocr-raw');
+    const roiAutoEl = document.getElementById('roi-auto');
 
-    // 七段顯示器樣式對照表（segment 順序：A上 B右上 C右下 D下 E左下 F左上 G中）
-    const SEG_PATTERNS = {
-        '1111110': 0, '0110000': 1, '1101101': 2, '1111001': 3, '0110011': 4,
-        '1011011': 5, '1011111': 6, '1110000': 7, '1111111': 8, '1111011': 9
-    };
-    // 各 segment 在字元邊界框內的取樣區域 [x0%, x1%, y0%, y1%]
-    const SEG_ZONES = [
-        [0.15, 0.85, 0.00, 0.18], // A 上橫
-        [0.60, 1.00, 0.10, 0.45], // B 右上豎
-        [0.60, 1.00, 0.55, 0.90], // C 右下豎
-        [0.15, 0.85, 0.82, 1.00], // D 下橫
-        [0.00, 0.40, 0.55, 0.90], // E 左下豎
-        [0.00, 0.40, 0.10, 0.45], // F 左上豎
-        [0.15, 0.85, 0.40, 0.60]  // G 中橫
-    ];
-    const VOTE_WINDOW = 10; // 多數決取樣窗：10 筆 × 200ms = 2 秒
-    const readings = [];
-    let mismatchStreak = 0; // 連續偏離讀值計數（連續性鎖定用）
+    const RING = 9;             // 對齊後保留的影格數；30fps 下約 0.3 秒
+    const CALIB_FRAMES = 9;     // 自動校準前先累積幾格
+    const RECAL_BAD_FRAMES = 90;// 追蹤連續失敗這麼多格就重新校準（約 3 秒）
+    const CALIB_RETRY = 30;     // 校準失敗後至少隔幾格才重試（會退避加長）
+    const DECIMALS = 1;         // PROBAT 顯示器固定一位小數
 
-    // 註：LED 掃描閃爍造成的不完整幀直接丟棄（decodeDigit 回傳 null），
-    //     由多數決濾波在時間軸上重建正確讀值；多幀疊加會因手持晃動糊化，不採用。
+    let work = null;      // 工作區（video 像素座標）；只在這塊裡面運算，省效能
+    let cal = null;       // 自動校準結果
+    let tracker = null;
+    let roiRef = null;    // LED 區域（工作區座標）
+    let dispBox = null;   // 顯示器外框（工作區座標），畫綠框用
+    let lastLoc = null;
+    let boxKey = null;
+    let badTicks = 0;
+    let tick = 0;        // 解碼週期計數（100ms 一次），用於溫度連續性判斷
+    let frames = 0;      // 擷取到的影格數
+    let pumping = false;
+    let mismatchStreak = 0;
+    let firstReadTick = null;
+    let lastAcceptTick = null;
+    let calNextTry = 0;   // 下次允許嘗試校準的 tick
+    let calFails = 0;
+    let calWhy = '';      // 校準失敗原因，顯示在除錯列上
+    const calBuf = [];    // 校準用的原始影格
+    const ring = [];      // 對齊＋扶正後的遮罩環形緩衝
 
-    function buildRedMask(imgData) {
-        const { data, width: w, height: h } = imgData;
-        const n = w * h;
-        // 紅色分數 = 紅通道超出綠/藍的量；先做直方圖找出此幀的亮度水準
-        const score = new Int16Array(n);
-        const hist = new Int32Array(256);
-        for (let i = 0; i < n; i++) {
-            const s = data[i * 4] - Math.max(data[i * 4 + 1], data[i * 4 + 2]);
-            score[i] = s;
-            hist[Math.max(0, Math.min(255, s))]++;
-        }
-        // 取 99.5 百分位當「此幀最亮紅色」，避免單一雜訊像素干擾
-        let acc = 0, p995 = 0;
-        const target = n * 0.005;
-        for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc >= target) { p995 = v; break; } }
-        // 自適應閾值：跟著此幀亮度走（LED 掃描變暗時整體變暗，相對亮度仍在），
-        // 但設下限避免全暗幀把雜訊放大成訊號
-        const th = Math.max(28, p995 * 0.35);
-        const mask = new Uint8Array(n);
-        let lit = 0;
-        for (let i = 0; i < n; i++) {
-            if (score[i] > th && data[i * 4] > 85) { mask[i] = 1; lit++; }
-        }
-        return { mask, lit };
-    }
-
-    function findClusters(mask, w, h) {
-        // 直欄投影：有紅色像素的連續欄位視為同一字元，欄位間空隙即字元間隔
-        const colCount = new Uint16Array(w);
-        for (let x = 0; x < w; x++) {
-            let c = 0;
-            for (let y = 0; y < h; y++) if (mask[y * w + x]) c++;
-            colCount[x] = c;
-        }
-        const maxGap = Math.max(2, Math.round(w * 0.02));
-        const spans = [];
-        let start = -1, gap = 0;
-        for (let x = 0; x < w; x++) {
-            if (colCount[x] > 0) { if (start < 0) start = x; gap = 0; }
-            else if (start >= 0 && ++gap > maxGap) { spans.push([start, x - gap]); start = -1; }
-        }
-        if (start >= 0) spans.push([start, w - 1]);
-
-        return spans.map(([x0, x1]) => {
-            let top = h, bot = 0, count = 0;
-            for (let y = 0; y < h; y++)
-                for (let x = x0; x <= x1; x++)
-                    if (mask[y * w + x]) { if (y < top) top = y; if (y > bot) bot = y; count++; }
-            return { x0, x1, top, bot, count, cw: x1 - x0 + 1, ch: bot - top + 1 };
-        }).filter(c => c.count >= 8); // 太小的雜訊群丟棄
-    }
-
-    function decodeDigit(mask, w, c) {
-        if (c.cw < c.ch * 0.35) return 1; // 窄字元（只有右側兩豎段）直接視為 1
-        // 各段位的亮像素比例
-        const fracs = SEG_ZONES.map(([fx0, fx1, fy0, fy1]) => {
-            const x0 = c.x0 + Math.floor(fx0 * c.cw), x1 = c.x0 + Math.ceil(fx1 * c.cw) - 1;
-            const y0 = c.top + Math.floor(fy0 * c.ch), y1 = c.top + Math.ceil(fy1 * c.ch) - 1;
-            let litPx = 0, total = 0;
-            for (let y = y0; y <= y1; y++)
-                for (let x = x0; x <= x1; x++) { total++; if (mask[y * w + x]) litPx++; }
-            return litPx / total;
-        });
-        // 最大似然解碼：對 10 個數字模板計分（亮段位比例高加分、暗段位比例低加分），
-        // 取最高分；與第二名差距不足表示字形曖昧，此幀丟棄交給多數決
-        let best = null, bestScore = -Infinity, second = -Infinity;
-        for (const [bits, digit] of Object.entries(SEG_PATTERNS)) {
-            let s = 0;
-            for (let i = 0; i < 7; i++)
-                s += (bits[i] === '1') ? (fracs[i] - 0.25) : (0.25 - fracs[i]);
-            if (s > bestScore) { second = bestScore; bestScore = s; best = digit; }
-            else if (s > second) second = s;
-        }
-        if (bestScore - second < 0.12) return null; // 信心不足
-        return best;
+    function resetCore() {
+        cal = null; tracker = null; roiRef = null; dispBox = null; lastLoc = null;
+        calBuf.length = 0; ring.length = 0;
+        badTicks = 0; mismatchStreak = 0;
+        calNextTry = 0; calFails = 0; calWhy = '';
+        firstReadTick = null; lastAcceptTick = null;
     }
 
     function drawDebugMask(mask, w, h) {
@@ -733,381 +1383,239 @@
         debugCanvas.height = h;
         const out = debugCtx.createImageData(w, h);
         for (let i = 0; i < w * h; i++) {
-            out.data[i * 4] = mask[i] ? 255 : 0;
+            out.data[i * 4] = mask[i] > window.LedCore.LIT ? 255 : 0;
             out.data[i * 4 + 3] = 255;
         }
         debugCtx.putImageData(out, 0, 0);
     }
 
-    // 自動 ROI 精煉：使用者只需大致框住顯示器，程式在框內尋找
-    // 「黑色顯示窗＋紅色 LED」的實際數字區域，並隨畫面晃動自動追蹤。
-    // 做法：暗區＋紅區做連通元件分析，取含紅色像素最多的元件（＝顯示窗；
-    // 面板上的指示燈圓點是孤立小元件，自然被排除）。
-    let refinedRoi = null; // 精煉後的 ROI（video 像素座標）
-    let refinedAge = 99;   // 距上次成功精煉的 tick 數，過舊即退回使用者紅框
-
-    function refineTempRoi() {
-        const coarse = getRoiPixelRect('roi-temp');
-        if (coarse.width < 24 || coarse.height < 16) return;
-        const img = procCtx.getImageData(coarse.x, coarse.y, coarse.width, coarse.height);
-        const d = img.data;
-        // 下採樣 2 倍以加速連通元件搜尋
-        const dw = coarse.width >> 1, dh = coarse.height >> 1;
-        const n = dw * dh;
-        const mark = new Uint8Array(n);   // 1 = 暗或紅（顯示窗候選）
-        const isRed = new Uint8Array(n);
-        const luma = new Float32Array(n);
-        let lumaSum = 0;
-        for (let y = 0; y < dh; y++)
-            for (let x = 0; x < dw; x++) {
-                const si = ((y * 2) * coarse.width + x * 2) * 4;
-                const r = d[si], g = d[si + 1], b = d[si + 2];
-                const i = y * dw + x;
-                luma[i] = 0.3 * r + 0.6 * g + 0.1 * b;
-                lumaSum += luma[i];
-                if (r - Math.max(g, b) > 40 && r > 85) { isRed[i] = 1; mark[i] = 1; }
-            }
-        // 暗區閾值隨框內平均亮度調整（顯示窗是黑的、面板是淺灰）
-        const darkTh = Math.min(100, Math.max(50, (lumaSum / n) * 0.55));
-        for (let i = 0; i < n; i++) if (luma[i] < darkTh) mark[i] = 1;
-
-        // BFS 連通元件：在暗區＋紅區中尋找「LED 顯示窗」。
-        // 鑑別條件（排除紅色按鈕等大片紅色物體）：
-        //   1. 暗底比例：顯示窗是黑底紅字，暗像素須多於紅像素；按鈕整片紅、無暗底
-        //   2. 紅色數量：太少代表只是雜訊或指示燈圓點
-        const label = new Int32Array(n);
-        const stack = [];
-        let cur = 0, bestRed = 0, bestBox = null;
-        for (let s = 0; s < n; s++) {
-            if (!mark[s] || label[s]) continue;
-            cur++;
-            let x0 = dw, x1 = 0, y0 = dh, y1 = 0, redN = 0, totalN = 0;
-            stack.length = 0; stack.push(s); label[s] = cur;
-            while (stack.length) {
-                const p = stack.pop();
-                const px = p % dw, py = (p / dw) | 0;
-                if (px < x0) x0 = px; if (px > x1) x1 = px;
-                if (py < y0) y0 = py; if (py > y1) y1 = py;
-                totalN++;
-                if (isRed[p]) redN++;
-                if (px > 0 && mark[p - 1] && !label[p - 1]) { label[p - 1] = cur; stack.push(p - 1); }
-                if (px < dw - 1 && mark[p + 1] && !label[p + 1]) { label[p + 1] = cur; stack.push(p + 1); }
-                if (py > 0 && mark[p - dw] && !label[p - dw]) { label[p - dw] = cur; stack.push(p - dw); }
-                if (py < dh - 1 && mark[p + dw] && !label[p + dw]) { label[p + dw] = cur; stack.push(p + dw); }
-            }
-            const darkN = totalN - redN;
-            if (redN >= 15 && darkN > redN && redN > bestRed) {
-                bestRed = redN;
-                bestBox = { x0, x1, y0, y1, id: cur };
-            }
-        }
-        if (!bestBox) return; // 找不到合格的顯示窗（LED 全暗幀等），保留上次結果
-
-        // 垂直方向裁到紅色數字所在列帶＋餘裕
-        //（避免顯示窗與機身暗部相連時，框到整片機身）
-        let ry0 = dh, ry1 = 0;
-        for (let y = bestBox.y0; y <= bestBox.y1; y++)
-            for (let x = bestBox.x0; x <= bestBox.x1; x++) {
-                const i = y * dw + x;
-                if (isRed[i] && label[i] === bestBox.id) { if (y < ry0) ry0 = y; if (y > ry1) ry1 = y; }
-            }
-        const padY = Math.max(2, Math.round((ry1 - ry0) * 0.3));
-        const fy0 = Math.max(bestBox.y0, ry0 - padY);
-        const fy1 = Math.min(bestBox.y1, ry1 + padY);
-
-        const rx = coarse.x + Math.max(0, bestBox.x0 - 1) * 2;
-        const ry = coarse.y + fy0 * 2;
-        const rw = Math.min(coarse.width, (bestBox.x1 - bestBox.x0 + 3) * 2);
-        const rh = Math.min(coarse.height, (fy1 - fy0 + 2) * 2);
-        if (rw < 20 || rh < 10) return;
-        if (rw / rh < 1.5) return; // 顯示窗必然寬扁；接近方形／圓形的是按鈕等誤判
-        refinedRoi = { x: rx, y: ry, width: rw, height: rh };
-        refinedAge = 0;
+    // 工作區＝使用者紅框往外放大。垂直方向留得多，因為追蹤模板通常是
+    // 顯示器下方那排按鍵，必須落在工作區內才追得到。
+    function workRect() {
+        const r = getRoiPixelRect('roi-temp');
+        const mx = r.width * 0.6, my = r.height * 1.2;
+        const x = Math.max(Math.round(r.x - mx), 0);
+        const y = Math.max(Math.round(r.y - my), 0);
+        return {
+            x: x, y: y,
+            width: Math.min(Math.round(r.x + r.width + mx), video.videoWidth) - x,
+            height: Math.min(Math.round(r.y + r.height + my), video.videoHeight) - y
+        };
     }
 
-    // 綠色虛線框顯示自動鎖定的區域
-    const roiAutoEl = document.getElementById('roi-auto');
+    function tryCalibrate() {
+        const C = window.LedCore;
+        const w = work.width, h = work.height;
+        const boxes = C.findDisplays(
+            C.maxComposite(calBuf.map(f => C.redness(f, w, h))), w, h);
+        if (!boxes.length) return '找不到顯示器';
+
+        // 使用者的紅框就代表他要哪一台顯示器：挑中心離紅框中心最近的
+        const r = getRoiPixelRect('roi-temp');
+        const cx = r.x + r.width / 2 - work.x, cy = r.y + r.height / 2 - work.y;
+        boxes.sort((a, b) => {
+            const da = Math.hypot((a.x0 + a.x1) / 2 - cx, (a.y0 + a.y1) / 2 - cy);
+            const db = Math.hypot((b.x0 + b.x1) / 2 - cx, (b.y0 + b.y1) / 2 - cy);
+            return da - db;
+        });
+        const box = boxes[0];
+
+        const refGray = C.grayscale(calBuf[calBuf.length - 1], w, h);
+        const pick = C.pickTemplate(refGray, C.grayscale(calBuf[0], w, h), w, h, box);
+        if (!pick) return '找不到可追蹤的面板特徵';
+
+        const bh = box.y1 - box.y0 + 1;
+        const rx = Math.max(Math.round(box.x0 - 1.5 * bh), 0);
+        const ry = Math.max(Math.round(box.y0 - 0.3 * bh), 0);
+        const roi = {
+            x: rx, y: ry,
+            w: Math.min(Math.round(box.x1 + 0.35 * bh), w) - rx,
+            h: Math.min(Math.round(box.y1 + 0.3 * bh), h) - ry
+        };
+        if (roi.w < 30 || roi.h < 20) return '顯示器太小';
+
+        const tr = new C.Tracker(refGray, w, h, pick.box, { radius: 60, pyramid: 4 });
+        const masks = calBuf.map(f => C.redness(
+            tr.warpRoi(f, roi, tr.locate(C.grayscale(f, w, h))), roi.w, roi.h));
+        const comp = C.maxComposite(masks);
+        const shear = C.estimateShear(comp, roi.w, roi.h);
+        const flat = C.deskew(comp, roi.w, roi.h, shear);
+
+        const c = { x0: 0, y0: 0, cellW: 0, cellH: 0, pitch: 0, nCells: 4,
+                    segOn: 0.30, shear: shear, decimals: DECIMALS };
+        if (C.fitGrid([flat], roi.w, roi.h, c) === null) return '字格對不上';
+        C.tuneSegOn([flat], roi.w, roi.h, c);
+        if (c.nCells < 2) return '位數不足';
+
+        cal = c; tracker = tr; roiRef = roi; dispBox = box;
+        return '';
+    }
+
+    // 綠色虛線框：顯示自動鎖定到的數字區域，並跟著追蹤結果移動
     function updateAutoRoiBox() {
-        if (!refinedRoi || refinedAge >= 15 || !video.videoWidth) {
+        if (!cal || !lastLoc || !video.videoWidth) {
             roiAutoEl.style.display = 'none';
             return;
         }
+        const dx = lastLoc.x - tracker.box.x0, dy = lastLoc.y - tracker.box.y0;
         roiAutoEl.style.display = 'block';
-        roiAutoEl.style.left = (refinedRoi.x / video.videoWidth * 100) + '%';
-        roiAutoEl.style.top = (refinedRoi.y / video.videoHeight * 100) + '%';
-        roiAutoEl.style.width = (refinedRoi.width / video.videoWidth * 100) + '%';
-        roiAutoEl.style.height = (refinedRoi.height / video.videoHeight * 100) + '%';
+        roiAutoEl.style.left = ((work.x + dispBox.x0 + dx) / video.videoWidth * 100) + '%';
+        roiAutoEl.style.top = ((work.y + dispBox.y0 + dy) / video.videoHeight * 100) + '%';
+        roiAutoEl.style.width = ((dispBox.x1 - dispBox.x0) / video.videoWidth * 100) + '%';
+        roiAutoEl.style.height = ((dispBox.y1 - dispBox.y0) / video.videoHeight * 100) + '%';
     }
 
-    // 單幀掃描：回傳此幀「讀得到的位數」清單（可以只有部分位數）與小數點位置。
-    // 不再要求整幀完整——整數位穩定期長，逐位數累積投票遠比單幀全對可靠。
-    let avgDigitW = null; // 一般數字的相對寬度（供窄字元「1」推算槽位中心）
-    function scanFrame() {
-        // 優先使用自動鎖定的區域；鎖定過舊（>1.5 秒）退回使用者紅框
-        const roi = (refinedRoi && refinedAge < 15) ? refinedRoi : getRoiPixelRect('roi-temp');
-        if (roi.width < 16 || roi.height < 10) return null;
-        const imgData = procCtx.getImageData(roi.x, roi.y, roi.width, roi.height);
-        const { mask, lit } = buildRedMask(imgData);
-        drawDebugMask(mask, roi.width, roi.height);
-        if (lit < 20) return null;
+    /**
+     * 每一個影片影格都要跑：擷取 -> 追蹤 -> 對齊 -> 推入環形緩衝。
+     *
+     * ★ 必須以影片的原生張數擷取，不能每 100ms 抓一次。
+     *   LED 是多工掃描的，每一格畫面只有一部分數字亮著；30fps 下疊 9 格只跨
+     *   0.3 秒就能湊滿所有筆劃，而且期間讀值還沒變。若只用 10fps 取樣，不但
+     *   要跨 0.9 秒（讀值早就變了），取樣週期還會和掃描頻率產生拍頻，
+     *   造成某一位數被系統性漏掉 —— 實測會把 186.1 讀成 86.1、155.0 讀成 15.4。
+     */
+    function captureFrame() {
+        if (!video.videoWidth || video.readyState < 2) return;
+        const C = window.LedCore;
 
-        const clusters = findClusters(mask, roi.width, roi.height);
-        if (!clusters.length) return null;
+        const wr = workRect();
+        const key = wr.x + ',' + wr.y + ',' + wr.width + ',' + wr.height;
+        if (key !== boxKey) { boxKey = key; work = wr; resetCore(); }  // 紅框被拖動 → 重新校準
+        if (work.width < 60 || work.height < 40) return;
 
-        const maxH = Math.max(...clusters.map(c => c.ch));
-        // 填滿率過濾：疊在同一直欄的指示燈圓點會形成高瘦但稀疏的群，
-        // 真正的數字（含「1」）在邊界框內填滿率遠高於 0.3
-        const digitClusters = clusters
-            .filter(c => c.ch > maxH * 0.6 && c.count / (c.cw * c.ch) >= 0.3)
-            .sort((a, b) => a.x0 - b.x0);
-        if (!digitClusters.length || digitClusters.length > 4) return null;
-        const topLine = Math.min(...digitClusters.map(c => c.top));
-        // 小數點：矮小且位於數字下緣的群
-        const dotXs = clusters
-            .filter(c => c.ch <= maxH * 0.35 && (c.top + c.bot) / 2 > topLine + maxH * 0.65)
-            .map(c => ((c.x0 + c.x1) / 2) / roi.width);
+        // 只把工作區畫進 canvas，不必搬整張畫面
+        procCanvas.width = work.width;
+        procCanvas.height = work.height;
+        procCtx.drawImage(video, work.x, work.y, work.width, work.height,
+                          0, 0, work.width, work.height);
+        const img = procCtx.getImageData(0, 0, work.width, work.height).data;
+        frames++;
 
-        const digits = [];
-        for (const c of digitClusters) {
-            const val = decodeDigit(mask, roi.width, c);
-            if (val === null) continue; // 這位讀不到就跳過，其他位照收
-            const wRel = c.cw / roi.width;
-            let xc = ((c.x0 + c.x1) / 2) / roi.width;
-            if (c.cw >= c.ch * 0.35) {
-                // 一般寬度數字：更新平均寬度
-                avgDigitW = avgDigitW === null ? wRel : avgDigitW * 0.9 + wRel * 0.1;
-            } else if (avgDigitW !== null) {
-                // 窄字元「1」靠槽位右側，以右緣回推槽位中心
-                xc = (c.x1 / roi.width) - avgDigitW / 2;
+        if (!cal) {
+            // 校準是重運算（手機上約 1 秒），只能偶爾做一次。
+            // 失敗就清掉緩衝重收一批，並拉長重試間隔——連續重試會把主執行緒卡死。
+            calBuf.push(new Uint8Array(img));
+            if (calBuf.length > CALIB_FRAMES) calBuf.shift();
+            if (calBuf.length === CALIB_FRAMES && frames >= calNextTry) {
+                calWhy = tryCalibrate();
+                if (calWhy) {
+                    calFails++;
+                    calNextTry = frames + Math.min(CALIB_RETRY * calFails, 90);
+                    calBuf.length = 0;
+                }
             }
-            digits.push({ xc, value: val });
+            if (cal) { calFails = 0; calBuf.length = 0; }
+            return;
         }
-        if (!digits.length) return null;
-        return { digits, dotXs, roi };
+
+        const loc = tracker.locate(C.grayscale(img, work.width, work.height), true);
+        if (loc.score < 0.4) {                       // 追丟了（被遮住、離開畫面）
+            if (++badTicks > RECAL_BAD_FRAMES) resetCore();
+            return;
+        }
+        badTicks = 0;
+        lastLoc = loc;
+
+        const m = C.deskew(
+            C.redness(tracker.warpRoi(img, roiRef, loc), roiRef.w, roiRef.h),
+            roiRef.w, roiRef.h, cal.shear);
+        ring.push(m);
+        if (ring.length > RING) ring.shift();
     }
 
-    // 位數槽位模型：溫度變化從小位數開始反應，高位數穩定很久——
-    // 每個位數槽獨立投票，用足各自穩定期內的所有幀
-    const slots = [];      // { xc, votes: [{v, tick}], roleInt, roleTenth }
-    let slotBoxKey = null;
-
-    function resetSlotsIfBoxJumped(roi) {
-        if (slotBoxKey) {
-            const dx = Math.abs(roi.x - slotBoxKey.x);
-            const dw = Math.abs(roi.width - slotBoxKey.width);
-            if (dx > roi.width * 0.1 || dw > roi.width * 0.15) slots.length = 0;
+    // 以影片原生張數驅動擷取。requestVideoFrameCallback 每畫一格就回呼一次，
+    // 且會帶正確的影格節奏；Firefox 尚未支援，退回 33ms 計時器。
+    function startPump() {
+        if (pumping) return;
+        pumping = true;
+        if (typeof video.requestVideoFrameCallback === 'function') {
+            const step = () => {
+                try { captureFrame(); } catch (err) { console.error('擷取失敗', err); resetCore(); }
+                video.requestVideoFrameCallback(step);
+            };
+            video.requestVideoFrameCallback(step);
+        } else {
+            setInterval(() => {
+                try { captureFrame(); } catch (err) { console.error('擷取失敗', err); resetCore(); }
+            }, 33);                                  // Firefox 尚未支援 rVFC
         }
-        slotBoxKey = { x: roi.x, width: roi.width };
     }
+    video.addEventListener('playing', startPump);
+    video.addEventListener('loadeddata', startPump);
 
-    function feedSlots(scan) {
-        for (const d of scan.digits) {
-            let s = null, best = 0.06; // 槽位配對容差：ROI 寬度的 6%
-            for (const cand of slots) {
-                const dist = Math.abs(cand.xc - d.xc);
-                if (dist < best) { best = dist; s = cand; }
-            }
-            if (!s) { s = { xc: d.xc, votes: [] }; slots.push(s); }
-            s.xc = s.xc * 0.8 + d.xc * 0.2;
-            s.votes.push({ v: d.value, tick });
-            if (s.votes.length > 20) s.votes.shift();
-        }
-        // 清除 3 秒沒觀測到的槽位
-        for (let i = slots.length - 1; i >= 0; i--)
-            if (!slots[i].votes.some(v => tick - v.tick <= 30)) slots.splice(i, 1);
-    }
-
-    function slotMode(s, windowTicks, minVotes) {
-        const freq = {};
-        let bestV = null, bestN = 0;
-        for (const e of s.votes) {
-            if (tick - e.tick > windowTicks) continue;
-            freq[e.v] = (freq[e.v] || 0) + 1;
-            if (freq[e.v] > bestN) { bestN = freq[e.v]; bestV = e.v; }
-        }
-        return bestN >= minVotes ? bestV : null;
-    }
-
-    // 結構先驗：PROBAT 顯示器固定一位小數 → 最右槽位＝小數位，其餘＝整數位。
-    // 不依賴小數點偵測（點太小太暗，經常整段影片抓不到）。
-    function assembleReading() {
-        const ordered = slots.slice().sort((a, b) => a.xc - b.xc);
-        if (ordered.length < 3 || ordered.length > 5) return null;
-
-        // 槽距檢查：位數等距排列，出現 1.6 倍以上的間距代表中間有位數缺席
-        //（例如個位槽過期後 155.9 會被誤組成 15.9）
-        const gaps = [];
-        for (let i = 1; i < ordered.length; i++) gaps.push(ordered[i].xc - ordered[i - 1].xc);
-        if (Math.max(...gaps) > Math.min(...gaps) * 1.6) return null;
-
-        const intSlots = ordered.slice(0, -1);
-        const tenthSlot = ordered[ordered.length - 1];
-
-        let intStr = '';
-        for (const s of intSlots) {
-            const v = slotMode(s, 20, 2); // 整數位很穩：2 秒窗、至少 2 票
-            if (v === null) return null;
-            intStr += v;
-        }
-        // 小數位變化快：取 0.8 秒內最新讀值；讀不到就只回整數（品質降級）
-        const tv = slotMode(tenthSlot, 8, 1);
-        let raw = tv !== null ? `${intStr}.${tv}` : intStr;
-        let value = parseFloat(raw);
-        // 安全網：無小數點且超出合理範圍 → 末位視為小數位（如 1538 → 153.8）
-        if (tv === null && value > 400 && raw.length >= 2) {
-            raw = raw.slice(0, -1) + '.' + raw.slice(-1);
-            value = parseFloat(raw);
-        }
-        if (!isFinite(value) || value < 0 || value > 400) return null;
-        return { value, raw };
-    }
-
-    // 多數決：取樣窗內出現至少 3 次的讀值中，優先採信位數最多者。
-    // LED 變暗缺字會讓「153.7」讀成「3.7」，反向（多出數字）幾乎不會發生，
-    // 因此位數多的讀值可信度更高。
-    function voteReadings() {
-        if (!readings.length) return null;
-        // 以整數部分分桶：小數位每秒都在變，逐值計票永遠湊不齊票數
-        const buckets = {};
-        for (const r of readings) {
-            const k = Math.floor(r.value);
-            if (!buckets[k]) buckets[k] = { n: 0, hasDp: false, digits: 0, latest: r.value };
-            const b = buckets[k];
-            b.n++;
-            if (r.hasDp) b.hasDp = true;
-            // 品質分數 = 整數位數 + 是否帶小數點（153.3 → 4 分，勝過 150 → 3 分）
-            b.digits = Math.max(b.digits, String(k).length + (r.hasDp ? 1 : 0));
-            b.latest = r.value; // 桶內取最新讀值，保留小數精度
-        }
-        let best = null;
-        for (const b of Object.values(buckets)) {
-            // 帶小數點的高品質桶 2 票即可，殘缺讀值桶要 3 票
-            if (b.n < (b.hasDp ? 2 : 3)) continue;
-            if (!best || b.digits > best.digits || (b.digits === best.digits && b.n > best.n)) {
-                best = b;
-            }
-        }
-        return best ? { value: best.latest, numDigits: best.digits, hasDp: best.hasDp, n: best.n } : null;
-    }
-
-    // 缺漏百位修復：LED 左半變暗常吃掉開頭的 1/2（153.7 → 53.7），
-    // 若讀值加回 100/200 後與目前鎖定值吻合，即視為同一數值救回。
-    // 僅限帶小數點的讀值——有小數點代表尾部完整、缺的是開頭；
-    // 沒有小數點的讀值（如 15）可能是缺尾巴（155 → 15），不能加百位硬修。
-    function repairReading(v, raw) {
-        if (!raw.includes('.')) return v;
-        if (currentTemp === null || Math.abs(v - currentTemp) <= 20) return v;
-        for (const add of [100, 200]) {
-            if (Math.abs(v + add - currentTemp) <= 20) return v + add;
-        }
-        return v;
-    }
-
-    let tick = 0;
-    let firstReadTick = null;  // 第一筆成功讀值的 tick（初始鎖定暖機期用）
-    let lastAcceptTick = null; // 上次採用讀值的 tick（變化率限制用）
-
-    // 物理連續性：溫度變化從小位數開始反應，高位數不會瞬間跳動。
-    // 允許變化幅度 = 基礎 2°C + 1.5°C/秒 × 距上次採用的時間（tick=100ms）
+    // 物理連續性把關：豆溫不會瞬間跳動。允許變化幅度 = 2°C + 1.5°C/秒。
+    // 舊版那一整套「缺百位修復、十倍位移防護、位數品質評分」是為了補救
+    // 單幀缺字造成的殘缺讀值；改成全張數擷取＋對齊疊加之後不會再出現，故移除。
     function allowedDelta() {
-        const dt = lastAcceptTick === null ? 0 : tick - lastAcceptTick;
-        return 2 + 0.15 * dt;
+        return 2 + 0.15 * (lastAcceptTick === null ? 0 : tick - lastAcceptTick);
     }
+
     function acceptTemp(v) {
         currentTemp = v;
         mismatchStreak = 0;
         lastAcceptTick = tick;
-        displayTemp.innerText = currentTemp.toFixed(1) + ' °C';
+        displayTemp.innerText = v.toFixed(1) + ' °C';
     }
-    const WARMUP_TICKS = 30;  // 暖機 3 秒（100ms/tick）：只適用於 3 位數的曖昧讀值；
-                              // 4 位數完整讀值（153.8）不可能是缺百位殘缺品，可立即鎖定
-    setInterval(() => {
-        if (video.readyState !== video.HAVE_ENOUGH_DATA || !video.videoWidth) return;
-        procCanvas.width = video.videoWidth;
-        procCanvas.height = video.videoHeight;
-        procCtx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
 
-        // 每 3 tick（0.3 秒）重新定位一次數字區域，追蹤畫面晃動
-        refinedAge++;
-        if (tick++ % 3 === 0) refineTempRoi();
-        updateAutoRoiBox();
-
-        // 逐位數掃描 → 餵入槽位投票 → 組合讀值
-        const scan = scanFrame();
-        let result = null;
-        if (scan) {
-            resetSlotsIfBoxJumped(scan.roi);
-            feedSlots(scan);
-            result = assembleReading();
-        }
-        if (result) {
+    function acceptReading(v) {
+        if (!isFinite(v) || v < 0 || v > 400) return;
+        if (currentTemp === null) {
             if (firstReadTick === null) firstReadTick = tick;
-            const repaired = repairReading(result.value, result.raw);
-            const hasDp = result.raw.includes('.');
-            // hasDp：顯示器永遠帶一位小數，讀到小數點代表字形完整、品質高
-            readings.push({ value: repaired, hasDp });
-            if (readings.length > VOTE_WINDOW) readings.shift();
-            const frameInfo = scan ? `（本幀 ${scan.digits.length} 位）` : '';
-            ocrRaw.innerText = repaired !== result.value
-                ? `位數組合：${result.raw} → 修復為 ${repaired.toFixed(1)}${frameInfo}`
-                : `位數組合：${result.raw}${frameInfo}`;
+            acceptTemp(v);
+        } else if (Math.abs(v - currentTemp) <= Math.min(allowedDelta(), 20)) {
+            acceptTemp(v);
+        } else if (++mismatchStreak >= 10) {
+            acceptTemp(v);                            // 持續約 1 秒的偏離 → 重新鎖定
+        }
+    }
 
-            // 快速通道：完整讀值且變化幅度符合物理連續性時，跳過投票立即更新——
-            // 小幅變動低風險，投票只留給大跳變把關（單筆讀值上限 ±10）
-            if (hasDp && currentTemp !== null
-                && Math.abs(repaired - currentTemp) <= Math.min(allowedDelta(), 10)) {
-                acceptTemp(repaired);
-            }
-        } else {
-            ocrRaw.innerText = scan
-                ? `位數組合：（累積中，本幀 ${scan.digits.length} 位）`
-                : '位數組合：（無法辨識）';
+    // 解碼與畫面更新維持 100ms 一次即可 —— 擷取才需要全張數，解碼不用。
+    setInterval(() => {
+        const C = window.LedCore;
+        updateAutoRoiBox();
+        tick++;
+
+        if (!cal) {
+            ocrRaw.innerText = '位數組合：（自動校準中' + (calWhy ? '：' + calWhy : '…') + '）';
+            return;
         }
-        // 連續性鎖定：烘豆溫度變化緩慢，突然偏離超過 20°C 的讀值
-        // 多半是缺字誤判，須連續出現才重新鎖定
-        const voted = voteReadings();
-        if (voted !== null) {
-            if (currentTemp === null) {
-                // 初始鎖定：4 位數完整讀值（153.8）立即鎖定——不可能是缺百位殘缺品；
-                // 3 位數讀值（53.8 有歧義）須等暖機期過且湊滿 3 票，防止偶發垃圾搶鎖
-                if (voted.hasDp
-                    && (voted.numDigits >= 4
-                        || (voted.numDigits >= 3 && voted.n >= 3
-                            && firstReadTick !== null
-                            && tick - firstReadTick >= WARMUP_TICKS))) {
-                    acceptTemp(voted.value);
-                }
-            } else if (Math.abs(voted.value - currentTemp)
-                       <= Math.min(allowedDelta(), voted.hasDp ? 20 : 6)) {
-                // 追蹤更新：變化幅度須符合物理連續性（高位數不會瞬間跳動）；
-                // 完整讀值上限 ±20、殘缺讀值上限 ±6
-                acceptTemp(voted.value);
-            } else if (voted.hasDp
-                       && (Math.abs(voted.value - (currentTemp + 100)) <= 20
-                           || Math.abs(voted.value - (currentTemp + 200)) <= 20)) {
-                // 向上 +100/+200 立即修正：若目前鎖在漏掉百位的低值（53.8），
-                // 出現完整讀值（153.8）時馬上跳上去——憑空多出一位數幾乎不可能
-                acceptTemp(voted.value);
-            } else if (voted.hasDp && Math.abs(voted.value * 10 - currentTemp) <= 20) {
-                // 十倍位移防護：讀值×10 ≈ 鎖定值（155.X 掉個位變 15.5）
-                // 是典型的掉位誤組——不採信、也不累積重鎖
-            } else if (voted.hasDp && ++mismatchStreak >= 10) {
-                // 只有帶小數點的完整讀值能改變鎖定；殘缺讀值再多次也不行
-                acceptTemp(voted.value); // 持續約 1 秒的遠離完整讀值 → 重新鎖定
+        if (ring.length < 3) { ocrRaw.innerText = '位數組合：（累積影格中…）'; return; }
+
+        try {
+            drawDebugMask(C.maxComposite(ring), roiRef.w, roiRef.h);
+            const res = C.readSample(ring, roiRef.w, roiRef.h, cal);
+            const v = C.toValue(res.raw, cal.decimals);
+            if (v !== null) {
+                ocrRaw.innerText = '位數組合：' + res.raw.trim();
+                acceptReading(v);
+            } else {
+                ocrRaw.innerText = '位數組合：（辨識中…）';
             }
-            if (currentTemp !== null) displayTemp.innerText = currentTemp.toFixed(1) + ' °C';
+        } catch (err) {
+            console.error('辨識失敗', err);
+            resetCore();
         }
-    }, 100); // 100ms/tick：投票窗 1 秒，反應延遲約 0.3~1 秒
+    }, 100);
+
 
     // 4. 計時器與 1 秒取樣控制
     startBtn.addEventListener('click', () => {
         startTime = Date.now();
         timeLabels.length = 0;
         tempData.length = 0;
+        markData.length = 0;
+        sampleSecs.length = 0;
+        pendingMarks = [];
         roastChart.update();
 
         startBtn.disabled = true;
         stopBtn.disabled = false;
+        loadBtn.disabled = true;
+        loadMsg.innerText = '';
+        crackBtn.disabled = false;
+        crackBtn.innerText = '★ 1爆';
+        dropBtn.disabled = false;
+        dropBtn.innerText = '☕ 下豆';
 
         roastTimer = setInterval(sampleTick, sampleSec * 1000);
     });
@@ -1126,15 +1634,94 @@
         // 將當前辨識到的溫度塞入圖表（辨識不到時留空，圖表顯示斷點）
         timeLabels.push(timeStr);
         tempData.push(currentTemp === null ? null : parseFloat(currentTemp.toFixed(1)));
+        sampleSecs.push(totalSeconds);
+        markData.push('');
 
-        // Y 軸動態範圍：涵蓋 最小值-5 ～ 最大值+5
+        // 按鈕通常按在兩次取樣之間：掛到時間上最接近的那個取樣點，
+        // 這樣星星的位置才會貼近實際按下的瞬間，而不是一律往後延一格
+        if (pendingMarks.length) {
+            const cur = markData.length - 1, prev = cur - 1;
+            pendingMarks.forEach(pm => {
+                const nearPrev = prev >= 0 &&
+                    Math.abs(pm.t - sampleSecs[prev]) < Math.abs(pm.t - totalSeconds);
+                const i = nearPrev ? prev : cur;
+                markData[i] = markData[i] ? markData[i] + pm.text : pm.text;
+            });
+            pendingMarks = [];
+        }
+
+        rescaleY();
+        roastChart.update();
+    }
+
+    // Y 軸動態範圍：涵蓋 最小值-5 ～ 最大值+5
+    function rescaleY() {
         const vals = tempData.filter(v => v !== null);
         if (vals.length) {
             roastChart.options.scales.y.min = Math.floor(Math.min(...vals)) - 5;
             roastChart.options.scales.y.max = Math.ceil(Math.max(...vals)) + 5;
         }
-        roastChart.update();
     }
+
+    // 讀取先前匯出的 CSV，把曲線與標記還原到圖上（純檢視，不影響辨識）
+    const loadBtn = document.getElementById('load-btn');
+    const loadMsg = document.getElementById('load-msg');
+    const csvInput = document.getElementById('csv-input');
+
+    function parseCsv(text) {
+        const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).filter(l => l.trim());
+        const rows = [];
+        lines.forEach(line => {
+            const c = line.split(',');
+            const label = (c[0] || '').trim();
+            if (!/^\d{1,3}:\d{2}$/.test(label)) return;      // 標題列或雜訊，跳過
+            const t = parseFloat(c[1]);
+            const mm = label.split(':');
+            rows.push({
+                label: label,
+                temp: isFinite(t) ? t : null,
+                mark: (c[2] || '').trim(),
+                sec: parseInt(mm[0], 10) * 60 + parseInt(mm[1], 10)
+            });
+        });
+        return rows;
+    }
+
+    loadBtn.addEventListener('click', () => csvInput.click());
+
+    csvInput.addEventListener('change', () => {
+        const file = csvInput.files && csvInput.files[0];
+        csvInput.value = '';                                  // 允許連續讀同一個檔
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+            let rows;
+            try {
+                rows = parseCsv(String(reader.result));
+            } catch (err) {
+                loadMsg.innerText = '讀取失敗：檔案格式不符';
+                return;
+            }
+            if (!rows.length) {
+                loadMsg.innerText = '讀取失敗：找不到「分:秒」格式的資料列';
+                return;
+            }
+            timeLabels.length = 0; tempData.length = 0;
+            markData.length = 0; sampleSecs.length = 0;
+            rows.forEach(r => {
+                timeLabels.push(r.label); tempData.push(r.temp);
+                markData.push(r.mark); sampleSecs.push(r.sec);
+            });
+            rescaleY();
+            roastChart.update();
+            displayTime.innerText = rows[rows.length - 1].label;
+            const marked = markData.filter(m => m).length;
+            loadMsg.innerText = `已載入 ${file.name}：${rows.length} 筆`
+                + (marked ? `、${marked} 個標記` : '');
+        };
+        reader.onerror = () => { loadMsg.innerText = '讀取失敗：無法開啟檔案'; };
+        reader.readAsText(file, 'utf-8');
+    });
 
     // 取樣間隔設定（1～10 秒，記憶於 localStorage；烘豆中調整立即生效）
     const sampleSlider = document.getElementById('sample-interval');
@@ -1160,26 +1747,83 @@
         }
     });
 
+    // 事件標記：記下按下的時刻，實際掛到哪個取樣點由 sampleTick 決定
+    function markEvent(btn, symbol) {
+        if (!roastTimer) return;
+        pendingMarks.push({ t: (Date.now() - startTime) / 1000, text: symbol });
+        btn.disabled = true;
+        btn.innerText = btn.innerText + ' ✓';
+    }
+    crackBtn.addEventListener('click', () => markEvent(crackBtn, '*'));
+    dropBtn.addEventListener('click', () => markEvent(dropBtn, '#'));
+
+    // 停止是不可逆的動作，先跳確認框；按取消時計時器完全不動，繼續烘不會掉資料
+    const confirmOverlay = document.getElementById('confirm-overlay');
+    const confirmInfo = document.getElementById('confirm-info');
+
+    function closeConfirm() { confirmOverlay.classList.remove('show'); }
+
     stopBtn.addEventListener('click', () => {
+        if (!roastTimer) return;
+        const marked = markData.filter(m => m).length;
+        confirmInfo.innerText = `已烘焙 ${displayTime.innerText}，共 ${timeLabels.length} 筆紀錄`
+            + (marked ? `、${marked} 個標記` : '');
+        confirmOverlay.classList.add('show');
+    });
+
+    document.getElementById('confirm-cancel').addEventListener('click', closeConfirm);
+    confirmOverlay.addEventListener('click', e => { if (e.target === confirmOverlay) closeConfirm(); });
+    document.getElementById('confirm-ok').addEventListener('click', () => {
+        closeConfirm();
+        finishRoast();
+    });
+
+    function finishRoast() {
         clearInterval(roastTimer);
         roastTimer = null;
         startBtn.disabled = false;
         stopBtn.disabled = true;
+        crackBtn.disabled = true;
+        dropBtn.disabled = true;
+        loadBtn.disabled = false;
+
+        // 按了標記但還沒輪到下一次取樣就停止，掛到最後一個點，避免遺失
+        if (pendingMarks.length && markData.length) {
+            const i = markData.length - 1;
+            pendingMarks.forEach(pm => { markData[i] = markData[i] ? markData[i] + pm.text : pm.text; });
+            pendingMarks = [];
+            roastChart.update();
+        }
 
         // 烘豆結束：自動生成 CSV 下載檔案
-        let csvContent = "data:text/csv;charset=utf-8,時間,溫度(°C)\n";
+        let csvContent = "時間,溫度(°C),標記\n";
         timeLabels.forEach((label, index) => {
-            csvContent += `${label},${tempData[index] === null ? '' : tempData[index]}\n`;
+            csvContent += `${label},${tempData[index] === null ? '' : tempData[index]},${markData[index] || ''}\n`;
         });
-        
-        const encodedUri = encodeURI(csvContent);
+
+        // 用 Blob 而不是 data: URI。data URI 會被標記符號 "#" 截斷
+        // （encodeURI 不跳脫 "#"，之後的內容全被當成錨點丟掉），而且有長度上限，
+        // 長時間烘豆的紀錄可能塞不下。開頭加 UTF-8 BOM，Excel 開中文標題才不會亂碼。
+        const blob = new Blob(["\uFEFF" + csvContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
-        link.setAttribute("href", encodedUri);
-        link.setAttribute("download", `PROBAT_烘豆紀錄_${new Date().toISOString().slice(0,10)}.csv`);
+        link.href = url;
+        // 用「開爐時間」而不是匯出時間命名，同一天多爐才分得出來是哪一爐。
+        // 注意要用當地時間：toISOString() 是 UTC，台灣清晨烘的豆會被標成前一天。
+        const d = new Date(startTime);
+        const pad = n => String(n).padStart(2, '0');
+        const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+                    + `_${pad(d.getHours())}${pad(d.getMinutes())}`;
+        link.download = `PROBAT_烘豆紀錄_${stamp}.csv`;
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
-    });
+        // 只用計時器延遲釋放，不要綁 pagehide／visibilitychange：
+        // 手機上「切出瀏覽器去開這個檔案」就會讓頁面進背景並觸發那些事件，
+        // 而瀏覽器下載 blob 是非同步的，此時提前 revoke 會得到空檔案。
+        // 留久一點，代價只是幾十 KB 的記憶體，關掉分頁時系統本來就會回收。
+        setTimeout(() => URL.revokeObjectURL(url), 300000);
+    }
 
     // 初始來源：?source=mp4 載入示範影片，否則預設開相機
     if (new URLSearchParams(location.search).get('source') === 'mp4') {
